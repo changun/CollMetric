@@ -1,225 +1,270 @@
-import model
-import utils
-reload(model)
-reload(utils)
-import model
-import utils
-from model import *
-from utils import *
-from sklearn.manifold import TSNE
-import sklearn
-from sklearn.cluster import KMeans
-from sklearn.metrics import silhouette_samples, silhouette_score
-import pyprind
+from hyperopt.mongoexp import MongoTrials
+from hyperopt import fmin, tpe, hp, STATUS_OK, Trials
+import logging, sys
+
+logging.basicConfig(
+    stream=sys.stderr,
+    level=logging.INFO)
 
 
-n_epochs = 2000
-sparsity = 8
-user_dict, photo_ids, user_ids = pickle.load(open("/home/ubuntu/dataset/dat_100_100000.p", "rb"))
-# V_features = v_features(photo_ids)
-V_features = numpy.load("/mnt/dat_100_100000.npy")
-numpy.random.seed(1)
-user_dict_reduced = dict(
-    [(i_index, set(numpy.random.choice(list(items), size=min(len(items), 100), replace=False))) for i_index, items in
-     user_dict.iteritems()])
-n_items, n_users, train_dict, valid_dict, test_dict, exclude_dict = preprocess(user_dict_reduced, portion=[8,1,1,0])
-V, clusters, clusters_3 = pickle.load( open("tmp.p", "rb"))
-kbpr1_c = pickle.load( open("kbpr1.p", "rb"))
+def objective(param):
+    from model import KBPRModel
+    from utils import early_stopping, bookcx, preprocess
+    import gc
+    n_items_bc, n_users_bc, train_dict_bc, valid_dict_bc, test_dict_bc, exclude_dict_bc = \
+        preprocess(bookcx(), portion=[8, 1, 1, 0])
+    bc_50 = KBPRModel(50, n_users_bc, n_items_bc, batch_size=-1,
+                      per_user_sample=1000, learning_rate=0.1, lambda_u=0.0,
+                      lambda_v=0.0, use_bias=True,
+                      K=1, margin=1, variance_mu=1, update_mu=True, lambda_variance=1,
+                      normalization=False, uneven_sample=True,
+                      use_warp=True, **param)
+    best_metric = early_stopping(bc_50, train_dict_bc, valid_dict_bc, test_dict_bc,
+                                 lambda m: -m.recall(valid_dict_bc, train_dict_bc)[0], save_model=False,
+                                 valid_per_user_sample=100, start_hard_case=10000, start_adagrad=0000, n_epochs=10000,
+                                 patience=1000)
+    del bc_50
+    gc.collect()
+    return best_metric
 
 
+trials = MongoTrials('mongo://localhost/exp_bookcx_bpr_50/jobs', exp_key='BookCX_50')
+best = fmin(objective,
+            space={"lambda_bias": hp.loguniform('lambda_bias', -5, 1),
+                   "lambda_cov": hp.loguniform('lambda_cov', -5, 5),
+                   "max_norm": hp.uniform('max_norm', 1, 2),
+                   },
+            algo=tpe.suggest,
+            max_evals=300,
+            trials=trials)
+
+trials_bias = MongoTrials('mongo://localhost/exp_bookcx_bpr_50_bias/jobs', exp_key='BookCX_50_Bias')
+best_bias = fmin(objective,
+                 space={"lambda_bias": hp.loguniform('lambda_bias', -5, 0),
+                        "lambda_cov": hp.choice("lambda_cov", [50.0]),
+                        "max_norm": hp.choice("max_norm", [1.3])
+                        },
+                 algo=tpe.suggest,
+                 max_evals=300,
+                 trials=trials)
+
+from hyperopt.mongoexp import MongoTrials
+from hyperopt import fmin, tpe, hp, STATUS_OK, Trials
+import logging, sys
+
+logging.basicConfig(
+    stream=sys.stderr,
+    level=logging.INFO)
 
 
-# define a search space
-from hyperopt import hp
-space = hp.choice('a',
-    [
-        ('case 1', 1 + hp.lognormal('c1', 0, 1)),
-        ('case 2', hp.uniform('c2', -10, 10))
-    ])
-
-# minimize the objective over the space
-from hyperopt import fmax, tpe
-best = fmin(objective, space, algo=tpe.suggest, max_evals=100)
-
-def run(model, **kwargs):
-    early_stopping(model, train_dict, valid_dict, exclude_dict, pre="S-" + str(sparsity) + " ",
-                   valid_per_user_sample=50, **kwargs)
-
-
-def extract_kmean(m, train_dict, n):
-    bar = pyprind.ProgBar(m.n_users)  # 1) initialization with number of iterations
-    scores = [0] * m.n_users
-    clusters = numpy.zeros((m.n_users, n, m.n_factors)).astype(theano.config.floatX)
-    for i in range(n):
-        clusters[:, i, :] = m.U.get_value()
-
-    for u in xrange(m.n_users):
-        bar.update()
-        if u in train_dict and len(train_dict[u]) > 3:
-            X = m.V.get_value()[list(train_dict[u])]
-            clusterer = KMeans(n_clusters=n, random_state=10)
-            cluster_labels = clusterer.fit_predict(X)
-            clusters[u, :, :] = clusterer.cluster_centers_
-            scores[u] = silhouette_score(X, cluster_labels)
-    return scores, clusters
-
-def plot_sse(m, train_dict):
-    bar = pyprind.ProgBar(m.n_users)  # 1) initialization with number of iterations
-    sse = []
-    for u in xrange(m.n_users):
-        bar.update()
-        if len(train_dict[u]) > 2:
-            X = m.V.get_value()[list(train_dict[u])]
-            clusterer = KMeans(n_clusters=2, random_state=10)
-            cluster_labels = clusterer.fit_predict(X)
-            sse.append(numpy.sum((X - U[u])**2) / numpy.sum((X  - clusterer.cluster_centers_[cluster_labels]) ** 2))
-    return scores, clusters
+def objective_lightfm(param):
+    from model import LightFMModel
+    from utils import bookcx, preprocess
+    import numpy
+    import gc
+    lambda_uv = param["lambda_uv"]
+    n_items_bc, n_users_bc, train_dict_bc, valid_dict_bc, test_dict_bc, exclude_dict_bc = \
+        preprocess(bookcx(), portion=[8, 1, 1, 0])
+    bc_warp = LightFMModel(50, n_users_bc, n_items_bc, lambda_v=lambda_uv, lambda_u=lambda_uv)
+    print bc_warp
+    best_metric = numpy.Infinity
+    patience = 6
+    for i in range(100):
+        bc_warp.train(train_dict_bc, epoch=50)
+        new_metric = -bc_warp.recall(valid_dict_bc, train_dict_bc, n=100)[0]
+        if new_metric > best_metric:
+            patience -= 1
+            print ("Patience %d" % (patience,))
+        else:
+            patience = 6
+            best_metric = new_metric
+        if patience == 0:
+            break
+    del bc_warp
+    gc.collect()
+    return best_metric
 
 
+warp_trials = MongoTrials('mongo://localhost/exp_bookcx_warp_50/jobs', exp_key='BookCX_50_WARP')
+best_warp = fmin(objective_lightfm,
+                 space={"lambda_uv": hp.loguniform('lambda_uv', -10, -2)},
+                 algo=tpe.suggest,
+                 max_evals=100,
+                 trials=warp_trials)
 
-scores, clusters = extract_kmean(kbpr1, train_dict)
+## LightFM
+from hyperopt.mongoexp import MongoTrials
+from hyperopt import fmin, tpe, hp, STATUS_OK, Trials
+import logging, sys
 
-
-# 1 mixture
-
-movie1 = KBPRModel(50, n_users, n_items,
-                        per_user_sample=50, learning_rate=0.01, lambda_u=1, K=1, margin=1, variance_mu=1, update_mu=False)
-run(movie1, start_adagrad=100, start_hard_case=100)
-
-
-# 2 mixtures
-U = clusters
-portions = numpy.zeros((n_users,1)).astype(theano.config.floatX) + 0.5
-U_k =  numpy.ndarray.transpose(U, (1,0,2)).reshape((n_users*2,50))
-
-kbpr2_kmean = KBPRModel(50, n_users, n_items, U=U_k, V=V, U_mixture_portion=portions.reshape(1, n_users),
-                        per_user_sample=50, learning_rate=0.01, lambda_u=1, K=2, margin=1, variance_mu=1)
-run(kbpr2_kmean, start_adagrad=0, start_hard_case=0)
+logging.basicConfig(
+    stream=sys.stderr,
+    level=logging.INFO)
 
 
+def objective_lightfm_5(param):
+    from model import LightFMModel
+    from utils import bookcx, preprocess
+    import numpy
+    import gc
+    lambda_uv = param["lambda_uv"]
+    n_items_bc, n_users_bc, train_dict_bc, valid_dict_bc, test_dict_bc, exclude_dict_bc = \
+        preprocess(bookcx(item_thres=5), portion=[8, 1, 1, 0])
+    bc_warp = LightFMModel(50, n_users_bc, n_items_bc, lambda_v=lambda_uv, lambda_u=lambda_uv)
+    print bc_warp
 
-# 3 mixtures
-U = clusters_3
-portions = numpy.zeros((n_users,2)).astype(theano.config.floatX) + (1/3.0)
-U_k =  numpy.ndarray.transpose(U, (1,0,2)).reshape((n_users*3,50))
-
-
-kbpr3_kmean = KBPRModel(50, n_users, n_items, U=U_k, V=V, U_mixture_portion=portions.reshape(2, n_users),
-                        per_user_sample=50, learning_rate=0.01, lambda_u=1, K=3, margin = 1, variance_mu=1)
-
-
-
-while True:
-    run(kbpr3_kmean, start_adagrad=0, start_hard_case=0, n_epochs=10)
-    kbpr3_kmean.recall(test_dict, exclude_dict, n_users=1000)
-    print numpy.mean(kbpr3_kmean.mixture_variance.get_value())
-    print numpy.mean((kbpr3_kmean.mixture_density.get_value() - 0.3333) ** 2)
-
-run(kbpr3_kmean, start_adagrad=0, start_hard_case=0)
+    del bc_warp
+    gc.collect()
+    return best_metric
 
 
+warp_trials_5 = MongoTrials('mongo://localhost/exp_bookcx_warp_50_5/jobs', exp_key='BookCX_50_WARP_5')
+best_warp_5 = fmin(objective_lightfm_5,
+                   space={"lambda_uv": hp.loguniform('lambda_uv', -10, -4)},
+                   algo=tpe.suggest,
+                   max_evals=100,
+                   trials=warp_trials_5)
 
-U = clusters_3
-portions = numpy.zeros((n_users,2)).astype(theano.config.floatX) + (1/3.0)
-U_k =  numpy.ndarray.transpose(U, (1,0,2)).reshape((n_users*3,50))
+## Ours
+from hyperopt.mongoexp import MongoTrials
+from hyperopt import fmin, tpe, hp, STATUS_OK, Trials
+import logging, sys
 
-kbpr3_norm = KNormalBPRModel(50, n_users, n_items, U=U_k, V=V, U_mixture_portion=portions.reshape(2, n_users),
-                             per_user_sample=50, learning_rate=0.01, lambda_u=1, K=3, margin=1.2, variance_mu=1,
-                             lambda_density=10,
-                             lambda_mean_distance=0,
-                             lambda_variance=10)
+logging.basicConfig(
+    stream=sys.stderr,
+    level=logging.INFO)
 
-#run(kbpr3_norm, start_adagrad=0, start_hard_case=0)
-
-while True:
-    run(kbpr3_norm, start_adagrad=0, start_hard_case=0, n_epochs=10)
-    kbpr3_norm.recall(valid_dict, train_dict, n_users=1000)
-    print numpy.mean(kbpr3_norm.mixture_variance.get_value())
-    print numpy.mean((kbpr3_norm.mixture_density.get_value() - 0.3333) ** 2)
-
-
-def stats(m, u):
-    i_index = T.lscalar()
-    items = T.lvector()
-    valid_items = T.lvector()
-    distances = ((m.U_norm_wide[:, i_index, :].reshape((2, 1, 50)) - m.V_norm) ** 2).sum(
-        axis=2).T  # shape: (n_items, K)
-    weighted_distances = -(distances / (2 * (m.mixture_variance[:, i_index] ** 2)))
-    scores_K = (weighted_distances + m.U_mixture_portion_derived[:, i_index])
-    assignments = scores_K.argmax(axis=1)
-    scores = scores_K.max(axis=1)
-    ranks = T.argsort(T.argsort(-scores))
-    mixture_distance = T.sum((m.U_norm_wide[0, i_index, :] - m.U_norm_wide[1,
-                                           i_index,
-                                           :]) ** 2)
-    avg_mixture_distance = T.sum((m.U_norm_wide[0, :, :] - m.U_norm_wide[1,
-                                                             :,
-                                                             :]) ** 2) / n_users
-    my_variances = m.mixture_variance[:,u]
-    mean_var = T.mean(m.mixture_variance)
-    outputs = \
-    [m.U_mixture_portion_derived[:, i_index],
-     my_variances,
-     mean_var,
-     mixture_distance,
-     avg_mixture_distance,
-     T.sum(assignments) / float(n_items),
-     T.sum(ranks[items]) / items.shape[0],
-     T.sum(ranks[valid_items]) / valid_items.shape[0]]
-    [portions, var, avg_var, distance, avg_mixture_distance, assignment, avg_rank, avg_valid] = theano.function([i_index, items, valid_items],
-                                                                 outputs
-                                                                 )(u, list(train_dict[u]), list(valid_dict[u]))
-    print ("Portions %s,%s, Variance %s/%g, D %s/%s, Assign %g Rank %g/%g" %
-           (portions, numpy.exp(portions), var, avg_var, distance, avg_mixture_distance, assignment, avg_rank, avg_valid))
-
-while True:
-    kbpr3_kmean.train(train_dict, adagrad=True, hard_case=True)
-    kbpr3_kmean.recall(valid_dict, train_dict, n_users=1000)
-    print "Valid " + str(kbpr3_kmean.validate(train_dict, valid_dict))
-
-while True:
-    kbpr1.train(train_dict, adagrad=True, hard_case=True)
-    kbpr1.recall(valid_dict, train_dict, n_users=1000)
-    print kbpr1.validate(train_dict, valid_dict)
+from model import KBPRModel, MaxMF
+from utils import early_stopping, bookcx, preprocess
 
 
-kbpr3_kmean = KBPRModel(50, n_users, n_items, U=U_k, V=V, U_mixture_portion=portions.reshape(2, n_users),
-                        per_user_sample=50, learning_rate=0.01, lambda_u=1, K=3, margin = 1, variance_mu=1)
-while True:
-    run(kbpr3_kmean, start_adagrad=0, start_hard_case=0, n_epochs=10)
-    kbpr3_kmean.recall(test_dict, exclude_dict)
+def objective_50_5(param):
+    from model import KBPRModel
+    from utils import early_stopping, bookcx, preprocess
+    import gc
+    n_items_bc, n_users_bc, train_dict_bc, valid_dict_bc, test_dict_bc, exclude_dict_bc = \
+        preprocess(bookcx(item_thres=5), portion=[8, 1, 1, 0])
+    bc_50 = KBPRModel(50, n_users_bc, n_items_bc, batch_size=-1,
+                      per_user_sample=50, learning_rate=0.1, lambda_u=0.0,
+                      lambda_v=0.0, use_bias=True,
+                      K=1, margin=1, variance_mu=1, update_mu=True, lambda_variance=1,
+                      normalization=False, uneven_sample=True,
+                      use_warp=True, **param)
+    best_metric = early_stopping(bc_50, train_dict_bc, valid_dict_bc, test_dict_bc,
+                                 lambda m: -m.recall(valid_dict_bc, train_dict_bc)[0], save_model=False,
+                                 valid_per_user_sample=100, start_hard_case=10000, start_adagrad=0000, n_epochs=10000,
+                                 patience=1000, validation_frequency=100)
+    del bc_50
+    gc.collect()
+    return best_metric
 
 
+trials_50_5 = MongoTrials('mongo://localhost/exp_bookcx_bpr_50_5/jobs', exp_key='BookCX_50')
+best_50_5 = fmin(objective_50_5,
+                 space={"lambda_bias": hp.loguniform('lambda_bias', -1, 1),
+                        "lambda_cov": hp.loguniform('lambda_cov', 3, 5),
+                        "max_norm": hp.uniform('max_norm', 1.1, 1.4),
+                        "uneven_sample": hp.choice("uneven_sample", [True, False])
+                        },
+                 algo=tpe.suggest,
+                 max_evals=300,
+                 trials=trials_50_5)
 
-for lambda_cov in [0, 0.0001, 0.001, 0.01, 0.1, 1, 10, 100, 1000]:
-    lastfm_150_cov = KBPRModel(150, n_users_fm, n_items_fm, batch_size=100000,
-                               per_user_sample=2000, learning_rate=0.1, lambda_u=0.01,
-                               lambda_v=0.01, lambda_bias=0.01, use_bias=True,
-                               K=1, margin=1, variance_mu=1, update_mu=True,
-                               normalization=False, uneven_sample=True, lambda_variance=1, lambda_cov=lambda_cov)
-    early_stopping(lastfm_150_cov, train_dict_fm, valid_dict_fm, test_dict_fm, pre="LastFM" + " ",
-                   valid_per_user_sample=200, n_epochs=1000, start_adagrad=0000, start_hard_case=10000)
+n_items_bc, n_users_bc, train_dict_bc, valid_dict_bc, test_dict_bc, exclude_dict_bc = \
+    preprocess(bookcx(item_thres=5), portion=[8, 1, 1, 0])
+bc_50 = KBPRModel(50, n_users_bc, n_items_bc, batch_size=-1,
+                  per_user_sample=100, learning_rate=0.1, lambda_u=0.0,
+                  lambda_v=0.0, use_bias=True,
+                  K=1, margin=1, variance_mu=1, update_mu=True, lambda_variance=1,
+                  normalization=False, uneven_sample=False,
+                  use_warp=True, lambda_cov=10, max_norm=1.3, lambda_bias=1)
+best_metric = early_stopping(bc_50, train_dict_bc, valid_dict_bc, test_dict_bc,
+                             lambda m: -m.recall(valid_dict_bc, train_dict_bc)[0], save_model=False,
+                             valid_per_user_sample=100, start_hard_case=10000, start_adagrad=0000, n_epochs=10000,
+                             patience=1000)
 
-n_items_1m, n_users_1m, train_dict_1m, valid_dict_1m, test_dict_1m, exclude_dict_1m = preprocess(movielens1M(4), portion=[8,1,1,0])
+## MovieLens10M
+
+from model import LightFMModel
+from utils import movielens10M, preprocess, early_stop_for_lightfm
+
+n_items_10m, n_users_10m, train_dict_10m, valid_dict_10m, test_dict_10m, exclude_dict_10m = \
+    preprocess(movielens10M(4.0), portion=[8, 1, 1, 0])
+bc_warp = LightFMModel(50, n_users_10m, n_items_10m, lambda_v=0.0001, lambda_u=0.0001)
+best_metric = early_stop_for_lightfm(bc_warp, train_dict_10m, lambda m: -m.recall(valid_dict_10m, train_dict_10m)[0])
+
+## Ours
+
+from model import KBPRModel
+from utils import movielens10M, preprocess, early_stopping
+
+n_items_10m, n_users_10m, train_dict_10m, valid_dict_10m, test_dict_10m, exclude_dict_10m = \
+    preprocess(movielens10M(4.0), portion=[8, 1, 1, 0])
+movie_10m_50 = KBPRModel(50, n_users_10m, n_items_10m, batch_size=-1,
+                         per_user_sample=10, learning_rate=0.1, lambda_u=0.0,
+                         lambda_v=0.0, use_bias=True,
+                         K=1, margin=1, variance_mu=1, update_mu=True, lambda_variance=1,
+                         normalization=False, uneven_sample=False,
+                         use_warp=True, lambda_cov=10, max_norm=1.3, lambda_bias=1)
+best_metric = early_stopping(movie_10m_50, train_dict_10m, valid_dict_10m, test_dict_10m,
+                             lambda m: -m.recall(valid_dict_10m, train_dict_10m, n_users=1000)[0], save_model=False,
+                             valid_per_user_sample=10, start_hard_case=10000, start_adagrad=0000, n_epochs=10000,
+                             patience=1000, validation_frequency=20)
+## Flickr
+
+from hyperopt.mongoexp import MongoTrials
+from hyperopt import fmin, tpe, hp, STATUS_OK, Trials
+import logging, sys
+
+logging.basicConfig(
+    stream=sys.stderr,
+    level=logging.INFO)
 
 
+def flickr_objective_50(param):
+    from model import KBPRModel
+    from utils import early_stop, flickr, preprocess
+    import gc, theano.misc.pkl_utils
+    from hyperopt import STATUS_OK
+    import cStringIO
+    n_items, n_users, train_dict, valid_dict, test_dict, exclude_dict = \
+        preprocess(flickr(), portion=[8, 1, 1, 0])
+    flickr_50 = KBPRModel(50, n_users, n_items,
+                          per_user_sample=50,
+                          learning_rate=0.1,
+                          variance_mu=1,
+                          update_mu=True,
+                          lambda_variance=1,
+                          use_warp=True, **param)
+    best_metric, best_model = early_stop(flickr_50, train_dict,
+                                         lambda m: -m.recall(valid_dict, train_dict, n_users=3000)[0],
+                                         n_epochs=10000,
+                                         patience=500, validation_frequency=100)
+    output = cStringIO.StringIO()
+    theano.misc.pkl_utils.dump(best_model, output)
+    del flickr_50
+    gc.collect()
 
-n_items_fm, n_users_fm, train_dict_fm, valid_dict_fm, test_dict_fm, exclude_dict_fm = preprocess(lastfm(), portion=[8,1,1,0])
+    return {"loss": best_metric, "attachments": {"model": output.getvalue()}, "status": STATUS_OK}
 
-movie1 = KBPRModel(50, n_users_1m, n_items_1m,
-                   per_user_sample=50, learning_rate=0.1, lambda_u=0.01, lambda_v=0.01, use_bias=True,
-                   lambda_bias=0.01, K=1, margin=1, variance_mu=0.1, update_mu=False, hard_case_chances=5)
 
-early_stopping(movie1, train_dict_1m, valid_dict_1m, test_dict_1m, pre="Movie ",
-               valid_per_user_sample=50, start_adagrad=000, start_hard_case=1000, n_epochs=50)
-while True:
-    early_stopping(movie1, train_dict_1m, valid_dict_1m, test_dict_1m, n_epochs=20, pre="Movie ",
-                   valid_per_user_sample=50, start_adagrad=0, start_hard_case=0)
-    print movie1.precision(valid_dict_1m, train_dict_1m, n=10)[0]
-    print movie1.wrong_hard_case_rate(valid_dict_1m)
+trials_50_flickr = MongoTrials('mongo://localhost/exp_flickr_bpr_50/jobs', exp_key='Flickr_50')
+best_50_5 = fmin(flickr_objective_50,
+                 space={"lambda_bias": hp.loguniform('lambda_bias', 0, 1),
+                        "lambda_cov": hp.loguniform('lambda_cov', 3, 5),
+                        "max_norm": hp.uniform('max_norm', 1.1, 1.3),
+                        "uneven_sample": hp.choice("uneven_sample", [False])
+                        },
+                 algo=tpe.suggest,
+                 max_evals=300,
+                 trials=trials_50_flickr)
 
-U = clusters3
-portions = numpy.zeros((n_users_1m,2)).astype(theano.config.floatX) + (1/3.0)
-U_k =  numpy.ndarray.transpose(U, (1,0,2)).reshape((n_users_1m*3,50))
-kbpr3 = KBPRModel(50, n_users_1m, n_items_1m, U=U_k, V=movie1.V.get_value(), U_mixture_portion=portions.reshape(2, n_users_1m),
-                        per_user_sample=50, learning_rate=0.01, lambda_u=1, K=3, margin=1, variance_mu=1)
+# U_3
+from hyperopt.mongoexp import MongoTrials
+from hyperopt import fmin, tpe, hp, STATUS_OK, Trials
+import logging, sys
+
+logging.basicConfig(
+    stream=sys.stderr,
+    level=logging.INFO)
+

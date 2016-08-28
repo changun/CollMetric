@@ -1,51 +1,132 @@
-import pyximport;
-
-pyximport.install()
-import fast_utils
-import copy
-import heapq
-import numpy
+from sampler import create_sampler, clean_sampler
 import pyprind
-import random
 import scipy
-import sys
+import numpy
+from lightfm import LightFM
+from utils import dict_to_coo
 import theano
+import time, sys
 import theano.tensor as T
 from theano.ifelse import ifelse
-import time
-from collections import defaultdict
-from theano.ifelse import ifelse
-from utils import *
-from lightfm import LightFM
-from multiprocessing import Pool
-import gc
-import signal
 
-gen = {}
-pool = Pool(processes=1)
-def sampler(id):
-    if id in gen:
-        return gen[id].next()
-    else:
-        return None
+print "Reload?"
 
-def init_sampler(id, train_dict, exclude_dict, n_items, per_user_sample):
-    signal.signal(signal.SIGINT, signal.SIG_IGN)
-    gen[id] = fast_utils.sample(train_dict, exclude_dict, n_items, per_user_sample)
+
+class MLP(object):
+    def __init__(self, feature_dim, n_embedding_dim, usage_count,
+                 activation="T.nnet.relu", n_layers=2, width=128,
+                 lambda_weight_l2=0.00001,
+                 lambda_weight_l1=0.0000):
+        self.lambda_weight_l1 = lambda_weight_l1
+        self.lambda_weight_l2 = lambda_weight_l2
+        self.n_embedding_dim = n_embedding_dim
+        self.n_layers = n_layers
+        self.usage_count = usage_count
+        self.width = width
+        # create weights
+        raw_visual_feature_factors = feature_dim
+        self.activation = activation
+        self.weights = []
+        self.bias = []
+        for i in range(self.n_layers):
+            in_dim = self.width
+            out_dim = self.width
+            if i == 0:
+                in_dim = raw_visual_feature_factors
+            if i == self.n_layers - 1:
+                out_dim = n_embedding_dim
+            self.weights += [
+                theano.shared(numpy.asarray(
+                    numpy.random.uniform(
+                        low=-numpy.sqrt(6. / (in_dim + out_dim)),
+                        high=numpy.sqrt(6. / (in_dim + out_dim)),
+                        size=(in_dim, out_dim)
+                    ),
+                    dtype=theano.config.floatX
+                ), borrow=True, name='weights_' + str(i)),
+            ]
+            self.bias += [theano.shared(numpy.asarray(
+                numpy.random.uniform(
+                    low=-numpy.sqrt(6. / (in_dim + out_dim)),
+                    high=numpy.sqrt(6. / (in_dim + out_dim)),
+                    size=(out_dim,)
+                ),
+                dtype=theano.config.floatX
+            ), borrow=True, name='weight_bias_' + str(i))]
+
+    def projection(self, features, scale, max_norm=numpy.Infinity, training=False, dropout_rate=0.5):
+        from theano.tensor.shared_randomstreams import RandomStreams
+        import theano.sparse
+        srng = RandomStreams(seed=12345)
+        def projection_f(j):
+            activation_fn = eval(self.activation)
+            ret = features #features[j]
+            for i in range(self.n_layers - 1):
+                hidden1 = self.weights[i]
+                if training:
+                    hidden1 = T.switch(srng.binomial(size=hidden1.shape, p=dropout_rate), hidden1, 0)
+                else:
+                    hidden1 = dropout_rate * hidden1
+                dot = T.dot
+                if i == 0 and isinstance(features.type, theano.sparse.SparseType):
+                    dot = theano.sparse.dot
+                ret = activation_fn(dot(ret, hidden1) + self.bias[i])
+            dot = T.dot
+            if self.n_layers == 1 and isinstance(features.type, theano.sparse.SparseType):
+                dot = theano.sparse.dot
+            embedding = dot(ret, self.weights[-1]) + self.bias[-1]
+            embedding *= scale
+            row_norms = T.sqrt(T.sum(T.sqr(embedding), axis=1))
+            desired_norms = T.clip(row_norms, 0, max_norm)
+            embedding *= (desired_norms / (row_norms )).reshape((embedding.shape[0], 1))
+            return embedding
+        return projection_f
+
+    def l2_reg(self):
+        return [[w, self.lambda_weight_l2, ] for w in self.weights] + \
+               [[w, self.lambda_weight_l2, ] for w in self.bias]
+
+    def l1_reg(self):
+        return [[w, self.lambda_weight_l1, ] for w in self.weights]
+
+    def updates(self):
+        updates = []
+        updates += [
+            [w, self.usage_count]
+            for w in self.weights]
+        updates += [
+            [w, self.usage_count]
+            for w in self.bias]
+        return updates
+
+    def copy(self):
+        import theano.misc.pkl_utils
+        buf = theano.misc.pkl_utils.BytesIO()
+        theano.misc.pkl_utils.dump(self, buf)
+        return theano.misc.pkl_utils.load(buf)
+
 
 class Model(object):
     def __init__(self, n_users, n_items):
         self.n_users = n_users
         self.n_items = n_items
+        self.signature = None
+
+    def check_signature(self, train_dict):
+        signature = sum(map(lambda u: sum(u[1])%(u[0]+1), train_dict.items()))
+        if self.signature is None or self.signature == signature:
+            self.signature = signature
+            return True
+        raise Exception("Inconsistent train dict signature")
 
     def normalize(self, variable):
         return variable / ((T.sum(variable ** 2, axis=1) ** 0.5).reshape((variable.shape[0], 1)))
 
     def copy(self):
-        return {
-            "n_users": self.n_users,
-            "n_items": self.n_items
-        }
+        import theano.misc.pkl_utils
+        buf = theano.misc.pkl_utils.BytesIO()
+        theano.misc.pkl_utils.dump(self, buf)
+        return theano.misc.pkl_utils.load(buf)
 
     def params(self):
         return [
@@ -91,34 +172,40 @@ class Model(object):
         finally:
             return numpy.mean(aucs), scipy.stats.sem(aucs)
 
-    def topN(self, users, exclude_dict, n=100):
+    def topN(self, users, exclude_dict, n=100, exclude_items=None):
+        # return top N item (sorted)
         for inx, scores in enumerate(self.scores_for_users(users)):
             user = users[inx]
             if exclude_dict is not None and user in exclude_dict:
                 scores[list(exclude_dict[user])] = -numpy.Infinity
-            yield numpy.argpartition(-scores, n)[0:n]
+            if exclude_items is not None and len(exclude_items) > 0:
+                scores[exclude_items] = -numpy.Infinity
+            top = numpy.argpartition(-scores, n)[0:n]
+            yield sorted(top, key=lambda i: -scores[i])
 
-    def recall(self, likes_dict, exclude_dict, n=100, n_users=None):
-        recall = []
-        try:
+    def recall(self, likes_dict, exclude_dict, ns=(100, 50, 10), n_users=None, exclude_items=None, users=None):
+        from collections import defaultdict
+        recall = defaultdict(list)
+
+        if users is None:
             if n_users is None:
                 users = likes_dict.keys()
             else:
                 numpy.random.seed(1)
                 users = numpy.random.choice(likes_dict.keys(), replace=False, size=n_users)
-            bar = pyprind.ProgBar(len(users))
-            for inx, top in enumerate(self.topN(users, exclude_dict, n=n)):
-                user = users[inx]
-                likes = likes_dict[user]
-                hits = [j for j in top if j in likes]
-                recall.append(len(hits) / float(len(likes)))
-                bar.update(item_id=str(numpy.mean(recall)))
-        except Exception as e:
-            sys.stderr.write(str(e))
-        finally:
-            return numpy.mean(recall), scipy.stats.sem(recall), recall
+        bar = pyprind.ProgBar(len(users))
+        for inx, top in enumerate(self.topN(users, exclude_dict, n=max(ns), exclude_items=exclude_items)):
+            user = users[inx]
+            likes = likes_dict[user]
+            for n in ns:
+                topn = top[0:n]
+                hits = [j for j in topn if j in likes]
+                recall[n].append(len(hits) / float(len(likes)))
+            bar.update(item_id=str(numpy.mean(recall[max(ns)])))
+        return [[numpy.mean(recall[n]), scipy.stats.sem(recall[n])] for n in ns]
 
-    def precision(self, likes_dict, exclude_dict, n=100, n_users=None):
+
+    def precision(self, likes_dict, exclude_dict, n=100, n_users=None, exclude_items=None):
         precision = []
         try:
             if n_users is None:
@@ -127,7 +214,7 @@ class Model(object):
                 numpy.random.seed(1)
                 users = numpy.random.choice(likes_dict.keys(), replace=False, size=n_users)
             bar = pyprind.ProgBar(len(users))
-            for inx, top in enumerate(self.topN(users, exclude_dict, n=n)):
+            for inx, top in enumerate(self.topN(users, exclude_dict, n=n, exclude_items=exclude_items)):
                 user = users[inx]
                 likes = likes_dict[user]
                 hits = [j for j in top if j in likes]
@@ -154,11 +241,13 @@ class Model(object):
         return repr_str
 
 
-
 class BPRModel(Model):
     def __init__(self, n_factors, n_users, n_items, U=None, V=None, b=None, lambda_u=0.1, lambda_v=0.1, lambda_b=0.1,
                  use_bias=True, use_factors=True,
-                 learning_rate=0.05, per_user_sample=10, bias_init=0.0, bias_range=(-numpy.Infinity, numpy.Infinity)):
+                 learning_rate=0.05, loss_f="sigmoid", margin=1, hard_case_margin=0, uneven_sample=False,
+                 per_user_sample=10,
+                 warp=False, batch_size=-1, bias_init=0.0,
+                 bias_range=(-numpy.Infinity, numpy.Infinity)):
 
         Model.__init__(self, n_users, n_items)
         self.n_factors = n_factors
@@ -175,15 +264,20 @@ class BPRModel(Model):
         self.b = b
         self.learning_rate = learning_rate
         self.per_user_sample = per_user_sample
+        self.batch_size = batch_size
+        self.uneven_sample = uneven_sample
         self.use_bias = use_bias
         self.bias_init = bias_init
         self.bias_range = bias_range
-
+        self.warp = warp
+        self.loss_f = loss_f
+        self.margin = margin
+        self.hard_case_margin = hard_case_margin
         if use_factors:
             if U is None:
                 self.U = theano.shared(
                     value=numpy.random.normal(0, 1 / (n_factors ** 0.5), (n_users, n_factors)).astype(
-                        theano.config.floatX),
+                        theano.config.floatX) / 5,
                     name='U',
                     borrow=True
                 )
@@ -198,7 +292,7 @@ class BPRModel(Model):
                 # randomly initialize user latent vectors
                 self.V = theano.shared(
                     value=numpy.random.normal(0, 1 / (n_factors ** 0.5), (n_items, n_factors)).astype(
-                        theano.config.floatX),
+                        theano.config.floatX) / 5,
                     name='V',
                     borrow=True
                 )
@@ -226,41 +320,26 @@ class BPRModel(Model):
                 borrow=True
             )
 
-        # user id
         self.triplet = T.lmatrix('triplet')
+        # user id
         self.i = self.triplet[:, 0]
-
         # a vector of pos item ids
         self.j_pos = self.triplet[:, 1]
         # a vector of neg item ids
         self.j_neg = self.triplet[:, 2]
 
-        self.unique_j = T.lvector()
-        # for those samples that do not appear in the triplet, set the count to -1
-        minus1 = T.zeros((self.n_items, 1), theano.config.floatX)-1
+        self.sample_weights = T.fvector()
+
+        all_j = T.concatenate((self.j_pos, self.j_neg))
+        one = numpy.asarray([1.0], dtype="float32").reshape((1, 1))
+
         # for those samples that do appear in the triplet, set the count to 0 first
+        self.item_sample_counts = T.inc_subtensor(T.zeros((self.n_items, 1), theano.config.floatX)[all_j],
+                                                  one)
 
-        one = numpy.asarray([1.0], dtype="float32").reshape((1,1))
+        self.unique_j = T.arange(n_items)[self.item_sample_counts[:,0].nonzero()]
 
-        self.item_sample_counts_with_minus = T.inc_subtensor(minus1[self.unique_j], one)
-        # add counts
-        self.item_sample_counts_with_minus = T.inc_subtensor(
-            T.inc_subtensor(self.item_sample_counts_with_minus[self.j_pos, :], one)[self.j_neg, :], one)
-        # add counts
-        self.item_sample_counts = T.inc_subtensor(
-            T.inc_subtensor(T.zeros((self.n_items, 1), theano.config.floatX)[self.j_pos, :], one)[self.j_neg, :], one)
-
-
-        self.unique_i =  T.lvector()
-        # for those samples that do not appear in the triplet, set the count to -1
-        minus1 = T.zeros((self.n_users, 1), theano.config.floatX) - 1
-        # for those samples that do appear in the triplet, set the count to 0 first
-        self.user_sample_counts_with_minus = T.inc_subtensor(minus1[self.unique_i, :], one)
-        # add counts
-        self.user_sample_counts_with_minus = T.inc_subtensor(self.user_sample_counts_with_minus[self.i, :], one)
-        # add counts
-        self.user_sample_counts = T.inc_subtensor(T.zeros((self.n_users, 1), theano.config.floatX)[self.i, :], one)
-
+        self.user_sample_counts = T.inc_subtensor(T.zeros((self.n_users, 1), theano.config.floatX)[self.i], one)
 
         # if use adagrad or not
         self.adagrad = T.iscalar('adagrad')
@@ -278,26 +357,17 @@ class BPRModel(Model):
         self.b_pos = self.b[self.j_pos]
         self.b_neg = self.b[self.j_neg]
 
+        # these variables will be initialized later
         self.f = None
         self.global_f = None
         self.score_f = None
         self.validate_f = None
-        self.cache_f = None
+        self.hard_cases = dict()
+        # user batch size for scoring (may be reduced to fit in GPU memory)
+        self.n_user_count = 4
+        self.value_f = None
+        self.warp_f = None
 
-    def copy(self):
-        z = super(BPRModel, self).copy()
-        z.update(
-            {"n_factors": self.n_factors,
-             "lambda_v": self.lambda_v,
-             "lambda_u": self.lambda_u,
-             "use_factors": self.use_factors,
-             "use_bias": self.use_bias,
-             "V": self.V.get_value(),
-             "U": self.U.get_value(),
-             "lambda_b": self.lambda_b,
-             "b": self.b.get_value(),
-             "learning_rate": self.learning_rate})
-        return z
 
     def params(self):
         return super(BPRModel, self).params() + [
@@ -308,14 +378,19 @@ class BPRModel(Model):
             ["l_v", self.lambda_v],
             ["l_b", self.lambda_b],
             ["per_u", self.per_user_sample],
-            ["bias", self.use_bias]
+            ["bias", self.use_bias],
+            ["uneven", self.uneven_sample]
         ]
 
     def l2_reg(self):
-        return [(self.U, self.lambda_u, self.user_sample_counts),
-                (self.V, self.lambda_v, self.item_sample_counts),
-                (self.b - self.bias_init, self.lambda_b, self.item_sample_counts)
-                ]
+        ret = []
+        if self.lambda_u != 0.0:
+            ret.append((self.U, self.lambda_u))
+        if self.lambda_v != 0.0:
+            ret.append((self.V, self.lambda_v))
+        if self.lambda_b != 0.0:
+            ret.append((self.b - self.bias_init, self.lambda_b))
+        return ret
 
     def l1_reg(self):
         return []
@@ -323,20 +398,20 @@ class BPRModel(Model):
     def updates(self):
         updates = []
         if self.use_factors:
-            updates += [[self.U, self.user_sample_counts_with_minus],
-                        # self.item_sample_counts_with_minus set -1 for those items that DO NOT appear in the triplet
+            updates += [[self.U, self.user_sample_counts],
+                        # self.item_sample_counts_with_minus is Infinity for those items that DO NOT appear in the triplet
                         # the gradient for those items should be zeros, we do so to avoid 0/0 = NAN issue
-                        [self.V, self.item_sample_counts_with_minus],
+                        [self.V, self.item_sample_counts],
                         ]
 
         if self.use_bias:
             def limit(b): return T.minimum(T.maximum(b, self.bias_range[0]), self.bias_range[1])
-            updates += [[self.b, self.item_sample_counts_with_minus, limit]]
+
+            updates += [[self.b, self.item_sample_counts, limit]]
         return updates
 
     def censor_updates(self):
         return []
-
 
     def delta(self):
         # user vector
@@ -352,6 +427,12 @@ class BPRModel(Model):
             return self.b[self.j_pos, 0] - self.b[self.j_neg, 0]
         return 0
 
+    def scores_ij(self, i, j):
+        scores = (self.U[i] * (self.V[j])).sum(axis=1)
+        if self.use_bias:
+            scores += self.b[j, 0]
+        return scores
+
     def bias_score(self):
         if self.use_bias:
             return self.b.reshape((self.n_items,))
@@ -365,99 +446,120 @@ class BPRModel(Model):
         return self.factor_score() + self.bias_score()
 
     def scores_for_users(self, users):
-        f = theano.function(
-            inputs=[self.i],
-            outputs=self.score_fn()
-        )
-        for users in numpy.array_split(numpy.asarray(users, dtype="int32"), len(users) // 4):
-            for scores in f(users):
-                yield scores
+        if self.score_f is None:
+            self.score_f = theano.function(
+                inputs=[self.i],
+                outputs=self.score_fn()
+            )
+        while self.n_user_count > 2:
+            try:
+                for users in numpy.array_split(numpy.asarray(users, dtype="int32"),
+                                               max(1, len(users) // self.n_user_count)):
+                    for scores in self.score_f(users):
+                        yield scores
+                break
+            except Exception as e:
+                print e
+                self.n_user_count /= 2
+                continue
 
     def loss(self, delta):
-        return -T.log(T.nnet.sigmoid(delta))
+        if self.loss_f == "sigmoid":
+            return -T.log(T.nnet.sigmoid(delta))
+        elif self.loss_f == "hinge":
+            return T.maximum(0, self.margin - delta)
 
     def cost(self):
         # user vector
+
         delta = self.delta()
         losses = self.loss(delta)
+        weighted_losses = losses * self.sample_weights
+        # re-weight loss based on their approximate rank
+        cost = weighted_losses.sum()
+        return cost, losses
 
-        cost = losses.sum()
-        for term, l, multiply in self.l2_reg():
-            cost += ((term ** 2) * multiply).sum() * l
+    def regularization_cost(self):
+        cost = 0
+        for term, l in self.l2_reg():
+            if float(l) != float(0.0):
+                cost += ((term ** 2) ).sum() * l
         for term, l in self.l1_reg():
-            cost += (abs(term)).sum() * l
-        return cost, losses,
+            if float(l) != float(0.0):
+                cost += (abs(term)).sum() * l
+        return cost
 
-    def sample(self, train_dict, exclude_dict=None, per_user_sample=None):
-        if per_user_sample is None:
-            per_user_sample = self.per_user_sample
+    def warp_func(self):
+        count = int(self.warp)
+        index_of_same_samples = (T.arange(self.triplet.shape[0]/count) * count)
+        pos_scores = T.repeat(self.scores_ij(self.i[index_of_same_samples], self.j_pos[index_of_same_samples]), count)
+        neg_scores = self.scores_ij(self.i, self.j_neg)
+        losses = T.maximum(0, self.margin - (pos_scores - neg_scores))
+        losses = losses.reshape((losses.shape[0] / count, count))
+        violations = (losses > 0).sum(1)
+        weights = T.switch(violations > 0, T.cast(T.log(self.n_items * violations / count), "float32"), T.zeros((violations.shape[0],), dtype="float32"))
+        active_sample_index = T.argmax(losses, axis=1) + (T.arange(self.triplet.shape[0]/count) * count)
+        active_samples = self.triplet[active_sample_index]
+        return theano.function([self.triplet], [active_samples, weights])
 
-        id = sum([ u * sum(items) for u, items in train_dict.items()])
-        if exclude_dict is not None:
-            id += sum([u * sum(items) for u, items in exclude_dict.items()])
-        id *= per_user_sample
-        samples = pool.apply_async(sampler, (id, )).get()
-        if samples is None:
-            pool.apply_async(init_sampler, (id, train_dict, exclude_dict, self.n_items, per_user_sample)).get()
-        res = pool.apply_async(sampler, (id,))
-        try:
-            while True:
-                samples = res.get()
-                res = pool.apply_async(sampler, (id, ))
-                yield samples
-
-        finally:
-            print "clear sampler!"
-
-
-
-
-
-
-    def gen_updates(self, cost, gen_updates):
+    def gen_updates(self, cost, per_sample_losses):
         update_list = []
         for update in self.updates():
             param = update[0]
             dividend = update[1]
+            regularization_cost = self.regularization_cost()
 
             history = theano.shared(
                 value=numpy.zeros(param.get_value().shape).astype(theano.config.floatX),
                 borrow=True
             )
-            if isinstance(dividend, int) or isinstance(dividend, long) or isinstance(dividend, float):
-                gradient = T.grad(cost=cost, wrt=param) / float(dividend)
-            else:
-                gradient = T.grad(cost=cost, wrt=param) / dividend
-            new_history = history + (gradient ** float(2))
+            gradient = T.grad(cost=cost, wrt=param, disconnected_inputs='ignore') / (T.cast(dividend, "float32") + 1E-10)
+            gradient += T.grad(cost=regularization_cost, wrt=param, disconnected_inputs='ignore')
+            new_history = ifelse(self.adagrad > 0, (history ) + (gradient ** float(2)), history)
             update_list += [[history, new_history]]
             adjusted_grad = ifelse(self.adagrad > 0, gradient / ((new_history ** float(0.5)) + float(1e-10)), gradient)
-            new_param = param - (adjusted_grad * float(self.learning_rate))
+            new_param = param - ((adjusted_grad ) * float(self.learning_rate))
             if len(update) == 3:
                 new_param = update[2](new_param)
+            # censored updates
             for censored_param, limit in self.censor_updates():
                 if param == censored_param:
                     col_norms = T.sqrt(T.sum(T.sqr(new_param), axis=1))
                     desired_norms = T.clip(col_norms, 0, limit)
-                    new_param *= (desired_norms / (1e-7 + col_norms)).reshape((new_param.shape[0], 1))
+                    new_param *= (desired_norms / (1e-10 + col_norms)).reshape((new_param.shape[0], 1))
             update_list += [[param, new_param]]
         return update_list
 
-    def train(self, train_dict, epoch=1, adagrad=False, hard_case=False):
-        if hard_case:
-            raise Exception("Hard case sampling is not supported")
-        if self.train_dict != train_dict:
-            self.train_dict = train_dict
-            self.sample_generator = self.sample(train_dict)
-        cost, per_sample_loss = self.cost()
+    def sample(self, train_dict, exclude_items):
+        return create_sampler(train_dict, None, self.n_items,
+                                               exclude_items=exclude_items,
+                                               per_user_sample=self.per_user_sample,
+                                               batch_size=self.batch_size,
+                                               uneven=self.uneven_sample,
+                                               warp=self.warp)
+
+    def train(self, train_dict, epoch=1, adagrad=False, hard_case=False, profile=False, exclude_items=None):
+        if self.warp is not False and self.warp_f is None:
+            self.warp_f = self.warp_func()
         if self.f is None:
+            self.check_signature(train_dict)
+            self.train_dict = train_dict
+            self.sample_generator = self.sample(train_dict, exclude_items)
+
+
+            cost, per_sample_losses = self.cost()
+
             self.f = theano.function(
-                inputs=[self.triplet, self.adagrad, self.unique_i, self.unique_j],
-                outputs=[cost, per_sample_loss],
-                updates=self.gen_updates(cost, per_sample_loss)
+                inputs=[self.triplet, self.sample_weights, self.adagrad],
+                outputs=[cost, per_sample_losses],
+                updates=self.gen_updates(cost, per_sample_losses),
+                profile=profile,
+                on_unused_input='warn'
             )
+
         # perform latent vector updates #
         epoch_index = 0
-        loss = []
+        losses = []
         sample_time = 0
         training_time = 0
         sample_start = time.time()
@@ -465,19 +567,29 @@ class BPRModel(Model):
             adagrad_val = 1
         else:
             adagrad_val = 0
-        for triplet, unique_i, unique_j in self.sample_generator:
+
+        for triplet in self.sample_generator:
             sample_time += time.time() - sample_start
-            # update latent vectors
             training_start = time.time()
-            loss.append(self.f(triplet, adagrad_val, unique_i, unique_j)[0])
+            if self.warp is not False:
+                triplet, weights = self.warp_f(triplet)
+            else:
+                weights = 1.0
+            # update latent vectors
+            loss, per_sample_losses = self.f(triplet, weights, adagrad_val)
+            losses.append(loss)
+            #print numpy.sum(per_sample_losses > 0) / float(len(per_sample_losses))
             training_time += time.time() - training_start
             epoch_index += 1
             if epoch_index == epoch:
                 sys.stderr.write(
                     "Train Time: %g Sample Time: %g\n" % (training_time, sample_time))
                 sys.stderr.flush()
-                return numpy.mean(loss)
+                return numpy.mean(losses)
             sample_start = time.time()
+
+
+
 
     def validate(self, train_dict, valid_dict, per_user_sample=100):
         if self.validate_f is None:
@@ -487,22 +599,38 @@ class BPRModel(Model):
                 inputs=[self.triplet],
                 outputs=T.switch(T.gt(delta, 0), 1.0, 0.0)
             )
-            self.valid_sample_generator = self.sample(valid_dict, train_dict, per_user_sample=per_user_sample)
-            self.train_valid_sample_generator = self.sample(train_dict, None, per_user_sample=per_user_sample)
+            self.valid_sample_generator = self.sample(train_dict, None)
+            self.train_valid_sample_generator = self.sample(valid_dict)
 
         results = None
-        if train_dict == None:
+        if train_dict is None:
             gen = self.train_valid_sample_generator
         else:
             gen = self.valid_sample_generator
         # sample triplet with the sample generator
-        for triplet, unique_i, unique_j in gen:
+        for triplet in gen:
             # update latent vectors
             results = self.validate_f(triplet)
             break
         results = results.reshape((len(results) / per_user_sample, per_user_sample))
         aucs = numpy.mean(results, axis=1)
         return numpy.mean(aucs), scipy.stats.sem(aucs)
+
+    def __getstate__(self):
+        import copy
+        ret = copy.copy(self.__dict__)
+        ret["f"] = None
+        ret["validate_f"] = None
+        ret["score_f"] = None
+        ret["sample_generator"] = None
+        ret["train_valid_sample_generator"] = None
+        ret["valid_sample_generator"] = None
+        ret["train_dict"] = None
+        ret["valid_dict"] = None
+        ret["trials"] = None
+        ret["hard_cases"] = dict()
+        ret["warp_f"] = None
+        return ret
 
 
 class BPRModelWithVisualBias(BPRModel):
@@ -617,15 +745,15 @@ class VisualBPRAbstractModel(BPRModelWithVisualBias):
             self.activation = None
 
         if weights is not None:
-            self.weights = [theano.shared(numpy.asarray(
+            self.sample_weights = [theano.shared(numpy.asarray(
                 w,
                 dtype=theano.config.floatX
             ), borrow=True)
-                            for w in weights
-                            ]
+                                   for w in weights
+                                   ]
         else:
             if self.nonlinear:
-                self.weights = [
+                self.sample_weights = [
                     theano.shared(numpy.asarray(
                         numpy.random.uniform(
                             low=-numpy.sqrt(6. / (raw_visual_feature_factors + 128)),
@@ -641,7 +769,7 @@ class VisualBPRAbstractModel(BPRModelWithVisualBias):
                 ]
 
                 for i in range(1, self.n_layers - 1):
-                    self.weights += [
+                    self.sample_weights += [
                         theano.shared(numpy.asarray(
                             numpy.random.uniform(
                                 low=-numpy.sqrt(6. / (128 + 128)),
@@ -656,7 +784,7 @@ class VisualBPRAbstractModel(BPRModelWithVisualBias):
                         ), borrow=True, name='weight_bias_' + str(i))
                     ]
 
-                self.weights += [theano.shared(numpy.asarray(
+                self.sample_weights += [theano.shared(numpy.asarray(
                     numpy.random.uniform(
                         low=-numpy.sqrt(6. / (128 + n_embedding_dim)),
                         high=numpy.sqrt(6. / (128 + n_embedding_dim)),
@@ -666,7 +794,7 @@ class VisualBPRAbstractModel(BPRModelWithVisualBias):
                 ), borrow=True, name='weights_end')]
             # linear embedding
             else:
-                self.weights = [theano.shared(numpy.asarray(
+                self.sample_weights = [theano.shared(numpy.asarray(
                     numpy.random.uniform(
                         low=-numpy.sqrt(6. / (raw_visual_feature_factors + n_embedding_dim)),
                         high=numpy.sqrt(6. / (raw_visual_feature_factors + n_embedding_dim)),
@@ -675,7 +803,7 @@ class VisualBPRAbstractModel(BPRModelWithVisualBias):
                     dtype=theano.config.floatX
                 ), borrow=True, name='weights')]
 
-        self.V_embedding = self.embedding(self.V_features, self.weights)
+        self.V_embedding = self.embedding(self.V_features, self.sample_weights)
 
         if use_visual_offset:
             self.V_offset = theano.shared(
@@ -787,7 +915,7 @@ class VisualBPRAbstractModel(BPRModelWithVisualBias):
         try:
             n_items = len(item_features)
 
-            self.V_embedding = self.embedding(to_T(item_features), self.weights)
+            self.V_embedding = self.embedding(to_T(item_features), self.sample_weights)
             cold_V_embedding = theano.function([], self.V_embedding)()
 
             if self.use_factors:
@@ -814,7 +942,7 @@ class VisualBPRAbstractModel(BPRModelWithVisualBias):
             {"lambda_weight_l1": self.lambda_weight_l1,
              "lambda_weight_l2": self.lambda_weight_l2,
              "lambda_v_offset": self.lambda_v_offset,
-             "weights": [w.get_value() for w in self.weights],
+             "weights": [w.get_value() for w in self.sample_weights],
              "u_weights": [w.get_value() for w in self.u_weights],
              "V_offset": V_offset,
              "use_visual_offset": self.use_visual_offset,
@@ -838,20 +966,20 @@ class VisualBPRAbstractModel(BPRModelWithVisualBias):
             ["act", self.activation]]
 
     def l2_reg(self):
-        reg = super(VisualBPRAbstractModel, self).l2_reg() + [[w, self.lambda_weight_l2] for w in self.weights]
+        reg = super(VisualBPRAbstractModel, self).l2_reg() + [[w, self.lambda_weight_l2] for w in self.sample_weights]
         if self.use_visual_offset:
             reg += [[self.V_offset, self.lambda_v_offset]]
         return reg
 
     def l1_reg(self):
-        return super(VisualBPRAbstractModel, self).l1_reg() + [[w, self.lambda_weight_l1] for w in self.weights]
+        return super(VisualBPRAbstractModel, self).l1_reg() + [[w, self.lambda_weight_l1] for w in self.sample_weights]
 
     def updates(self):
         updates = super(VisualBPRAbstractModel, self).updates()
 
         updates += [
             [w, self.n_users * self.per_user_sample]
-            for w in self.weights + self.u_weights]
+            for w in self.sample_weights + self.u_weights]
 
         if self.use_visual_offset:
             updates += [
@@ -1361,11 +1489,871 @@ class UserVisualModel(VisualBPRConcatModel):
 
 
 class KBPRModel(BPRModel):
+    def __init__(self, n_factors, n_users, n_items, U=None, V=None, b=None, K=1, margin=1, hard_case_margin=-1,
+                 mixture_density=None,
+                 uneven_sample=False,
+                 use_bias=True,
+                 warp=True,
+                 lambda_u=0.0,
+                 lambda_v=0.0,
+                 lambda_bias=0.1,
+                 lambda_mean_distance=0.0,
+                 lambda_variance=1.0,
+                 lambda_density=1.0,
+                 lambda_cov=10,
+                 variance_mu=1.0,
+                 bias_init=0.5,
+                 update_mu=True,
+                 update_density=True,
+                 hard_case_chances=2,
+                 learning_rate=0.01,
+                 per_user_sample=10,
+                 normalization=False,
+                 bias_range=(1E-6, 10),
+                 batch_size=-1,
+                 max_norm=1):
+        if U is None:
+            U = numpy.random.normal(0, 1 / (n_factors ** 0.5), (n_users * K, n_factors)).astype(
+                theano.config.floatX) / 5
+
+        BPRModel.__init__(self, n_factors, n_users, n_items, U, V, b, lambda_u, lambda_v, lambda_bias,
+                          use_bias=use_bias,
+                          use_factors=True,
+                          loss_f="hinge",
+                          margin=margin,
+                          learning_rate=learning_rate,
+                          uneven_sample=uneven_sample,
+                          per_user_sample=per_user_sample,
+                          batch_size=batch_size,
+                          warp=warp,
+                          hard_case_margin=hard_case_margin,
+                          bias_init=bias_init, bias_range=bias_range, )
+        self.K = K
+        self.lambda_mean_distance = lambda_mean_distance
+        self.lambda_variance = lambda_variance
+        self.lambda_density = lambda_density
+        self.lambda_cov = lambda_cov
+        self.update_mu = update_mu
+        self.update_density = update_density
+        self.normalization = normalization
+        self.variance_mu = variance_mu
+        self.max_norm = max_norm
+
+        # unused
+        self.hard_case_chance = hard_case_chances
+
+        if mixture_density is None:
+            self.mixture_density = theano.shared(
+                value=numpy.zeros((K, n_users)).astype(theano.config.floatX) + (1.0 / K),
+                name='U_mixture_portion',
+                borrow=True
+            )
+        else:
+            self.mixture_density = theano.shared(
+                value=mixture_density,
+                name='U_mixture_portion',
+                borrow=True
+            )
+
+        self.mixture_variance = theano.shared(
+            value=numpy.zeros((K, n_users)).astype(theano.config.floatX) + self.variance_mu,
+            name='variance',
+            borrow=True
+        )
+        # self.item_variance = theano.shared(
+        #     value=numpy.zeros((n_items, 1)).astype(theano.config.floatX) + 1.0,
+        #     name='variance',
+        #     borrow=True
+        # )
+
+
+        if normalization:
+            self.V_norm = self.normalize(self.V)
+            self.U_norm = self.normalize(self.U)
+        else:
+            self.V_norm = self.V
+            self.U_norm = self.U
+
+        self.U_norm_wide = self.U_norm.reshape((self.K, self.n_users, self.n_factors))
+        self.mixture_variance_long = self.mixture_variance.reshape((self.K * self.n_users, 1))
+        self.log_mixture_density_wide = T.log(self.mixture_density / self.mixture_density.sum(0)) #/
+        self.log_mixture_density_long = self.log_mixture_density_wide.reshape((self.K * self.n_users, 1))
+
+        if K == 1:
+            self.pos_i_cluster = self.i
+            self.neg_i_cluster = self.i
+        else:
+            self.pos_i_cluster = self.assign_cluster(self.i, self.j_pos)
+            self.neg_i_cluster = self.assign_cluster(self.i, self.j_neg)
+            one = numpy.asarray([1.0], dtype="float32").reshape((1, 1))
+            self.user_sample_counts = T.inc_subtensor(
+                T.zeros((self.n_users * self.K, 1), theano.config.floatX)[self.pos_i_cluster],
+                one)
+            self.user_sample_counts = T.inc_subtensor(self.user_sample_counts[self.neg_i_cluster], one)
+
+        self.init_f = None
+
+    def censor_updates(self):
+        return super(KBPRModel, self).censor_updates() + [[self.V, self.max_norm], [self.U, self.max_norm]]
+
+    def updates(self):
+
+        updates = super(KBPRModel, self).updates()
+
+        def fix(x):
+            return T.maximum(1E-6, x)
+
+        if self.update_density and self.K > 1:
+            updates += [
+                [self.mixture_density, self.user_sample_counts.reshape((self.K, self.n_users)), fix]]
+        if self.update_mu:
+            updates += [[self.mixture_variance, self.user_sample_counts.reshape((self.K, self.n_users))]]
+        #updates += [[self.item_variance, self.item_variance]]
+        return updates
+
+    def cov_penalty(self, X):
+        X = X - (X.sum(axis=0) / T.cast(X.shape[0], theano.config.floatX))
+        return T.fill_diagonal(T.dot(X.T, X) / T.cast(X.shape[0], theano.config.floatX),
+                               T.cast(0, theano.config.floatX))
+
+    def cov_penalty_vectors(self):
+        return [self.V, self.U]
+    def l1_reg(self):
+        reg = super(KBPRModel, self).l1_reg()
+        if self.K > 1:
+            reg += [[self.mixture_density / self.mixture_density.sum(0), self.lambda_density]]
+
+        #reg += [[0 - self.scores_ij(self.i, self.j_pos), 0.001]]
+        return reg
+    def l2_reg(self):
+        reg = super(KBPRModel, self).l2_reg()
+        reg += [[(self.mixture_variance - self.variance_mu), self.lambda_variance]]
+        #reg += [[(self.item_variance - self.variance_mu), self.lambda_variance]]
+
+        if self.lambda_mean_distance != 0.0:
+            center = T.concatenate([self.U_norm_wide.sum(0) / T.cast(self.K, "float32")] * self.K)
+            reg += [[self.U - center, self.lambda_mean_distance]]
+
+        reg += [[self.cov_penalty(T.concatenate(self.cov_penalty_vectors())),
+                 self.lambda_cov]]
+        return reg
+
+    def assign_cluster(self, i, j):
+        variance = self.mixture_variance[:, i] #* self.item_variance[j,0]
+        distance = ((self.U_norm_wide[:, i, :] - self.V_norm[j]) ** 2).sum(axis=2)
+        normal = -(distance / (2 * (variance ** 2))) - (
+            T.log(variance ** 2) / 2)
+        return (normal + self.log_mixture_density_wide[:, i]).argmax(
+            axis=0) * self.n_users + i
+
+    def factor_score_cluster_ij(self, i, j):
+        distance = ((self.U_norm[i, :] - self.V_norm[j]) ** 2).sum(axis=1)
+        distance_p = -(distance / (2 * (self.mixture_variance_long[i, 0] ** 2))) - (
+            T.log(self.mixture_variance_long[i, 0] ** 2) / 2) + self.log_mixture_density_long[i, 0]
+        return distance_p
+
+    def factor_delta(self):
+        pos_scores = self.factor_score_cluster_ij(self.pos_i_cluster, self.j_pos)
+        neg_scores = self.factor_score_cluster_ij(self.neg_i_cluster, self.j_neg)
+        return pos_scores - neg_scores
+
+    def bias_delta(self):
+        if self.use_bias:
+            return T.log(self.b[self.j_pos, 0]) - T.log(self.b[self.j_neg, 0])
+        return 0
+
+    def scores_ij(self, i, j):
+        i_cluster = self.assign_cluster(i, j)
+        scores = self.factor_score_cluster_ij(i_cluster, j)
+        if self.use_bias:
+            scores += T.log(self.b[j, 0])
+        return scores
+
+    def bias_score(self):
+        if self.use_bias:
+            return T.log(self.b).reshape((self.n_items,))
+        return 0
+
+    def factor_score(self):
+        variance = self.mixture_variance.reshape((1, self.K, self.n_users))
+        if "item_variance" in self.__dict__:
+            item_variance = self.item_variance.reshape((self.n_items, 1, 1))
+        else:
+            item_variance = 1.0 #numpy.zeros((self.n_items, 1, 1), dtype="float32") + 1
+        portion = self.log_mixture_density_wide.reshape((1, self.K, self.n_users))
+        v_norm_wide = self.V_norm.reshape((self.n_items, 1, 1, self.n_factors))  # (items, 1, ,1, factors)
+        distance = ((self.U_norm_wide[:, self.i, :] - v_norm_wide) ** 2).sum(axis=3)  # (items, K, users)
+        normal = -(distance / (2 * ((variance[:, :, self.i] * item_variance) ** 2))) - (T.log((item_variance * variance[:, :, self.i]) ** 2) / 2)
+        return (normal + portion[:, :, self.i]).max(axis=1).T  # transpose (items, users) to (users, items)
+
+    def kmean(self, train_dict, K, user_batch=5000):
+        from sklearn.utils.extmath import row_norms
+        import numpy as np
+        import scipy.sparse as sp
+        from sklearn.metrics.pairwise import euclidean_distances
+        def _k_init(X, n_local_trials=None):
+
+            # from https://github.com/scikit-learn/scikit-learn/blob/51a765a/sklearn/cluster/k_means_.py#L43
+
+            n_clusters = K
+            random_state = numpy.random.RandomState(1)
+            x_squared_norms = row_norms(X, squared=True)
+
+            n_samples, n_features = X.shape
+
+            centers = np.empty((n_clusters, n_features))
+
+            assert x_squared_norms is not None, 'x_squared_norms None in _k_init'
+
+            # Set the number of local seeding trials if none is given
+            if n_local_trials is None:
+                # This is what Arthur/Vassilvitskii tried, but did not report
+                # specific results for other than mentioning in the conclusion
+                # that it helped.
+                n_local_trials = 2 + int(np.log(n_clusters))
+
+            # Pick first center randomly
+            center_id = random_state.randint(n_samples)
+            if sp.issparse(X):
+                centers[0] = X[center_id].toarray()
+            else:
+                centers[0] = X[center_id]
+
+            # Initialize list of closest distances and calculate current potential
+            closest_dist_sq = euclidean_distances(
+                centers[0, np.newaxis], X, Y_norm_squared=x_squared_norms,
+                squared=True)
+            current_pot = closest_dist_sq.sum()
+
+            # Pick the remaining n_clusters-1 points
+            for c in range(1, n_clusters):
+                # Choose center candidates by sampling with probability proportional
+                # to the squared distance to the closest existing center
+                rand_vals = random_state.random_sample(n_local_trials) * current_pot
+                candidate_ids = np.searchsorted(closest_dist_sq.cumsum(), rand_vals)
+
+                # Compute distances to center candidates
+                distance_to_candidates = euclidean_distances(
+                    X[candidate_ids], X, Y_norm_squared=x_squared_norms, squared=True)
+
+                # Decide which candidate is the best
+                best_candidate = None
+                best_pot = None
+                best_dist_sq = None
+                for trial in range(n_local_trials):
+                    # Compute potential when including center candidate
+                    new_dist_sq = np.minimum(closest_dist_sq,
+                                             distance_to_candidates[trial])
+                    new_pot = new_dist_sq.sum()
+
+                    # Store result if it is the best local trial so far
+                    if (best_candidate is None) or (new_pot < best_pot):
+                        best_candidate = candidate_ids[trial]
+                        best_pot = new_pot
+                        best_dist_sq = new_dist_sq
+
+                # Permanently add best center candidate found in local tries
+                if sp.issparse(X):
+                    centers[c] = X[best_candidate].toarray()
+                else:
+                    centers[c] = X[best_candidate]
+                current_pot = best_pot
+                closest_dist_sq = best_dist_sq
+
+            return centers
+
+        # variables
+        prev_cost = theano.shared(numpy.cast['float32'](numpy.Infinity))
+        all_clusters = []
+        start = 0
+        V = self.V.get_value()
+        while True:
+            end = min(start + user_batch, self.n_users)
+            # positive samples
+            tuples = []
+            n_users = end - start
+            init_clusters = numpy.zeros((n_users, K, self.n_factors))
+            for u, items in train_dict.items():
+                if start <= u < end:
+                    # set initial centers with KMeans++
+                    init_clusters[u - start, :, :] = _k_init(V[list(items)])
+                    # add (user,item) pairs
+                    for i in items:
+                        tuples.append((u-start, i, 0))
+
+            # theano
+            clusters = theano.shared(numpy.transpose(init_clusters, [1, 0, 2]).astype("float32").reshape((n_users * K, self.n_factors)))
+            clusters_norm_wide = clusters.reshape((K, n_users, self.n_factors))
+            distance = ((clusters_norm_wide[:, self.i, :] - self.V_norm[self.j_pos]) ** 2).sum(axis=2)
+            assign = distance.argmin(axis=0) * n_users + self.i
+
+            cost = (((clusters[assign] - self.V_norm[self.j_pos]) ** 2).sum(axis=1) ).sum()
+            new_clusters = T.inc_subtensor(T.zeros(clusters.shape)[assign], self.V_norm[self.j_pos])
+            one = numpy.asarray([1.0], dtype="float32").reshape((1, 1))
+            density = T.inc_subtensor(T.zeros((clusters.shape[0],1))[assign], one)
+            new_clusters /= density + 1E-9
+
+            f = theano.function([self.triplet], [cost, (prev_cost - cost) / prev_cost, density], updates=[
+                [prev_cost, cost],
+                [clusters, new_clusters]])
+            i = 0
+            while True:
+                i += 1
+                cur_cost, diff, assignments = f(tuples)
+                print ("Iter %d, Cost %g, Converge %g" % (i, cur_cost, diff))
+                if abs(diff) < 1e-6 and i>30:
+                    break
+            all_clusters.append(numpy.transpose(clusters.get_value().reshape((K, n_users, self.n_factors)),axes=[1,0,2]))
+            start = end
+            if start == self.n_users:
+                break
+        return numpy.transpose(numpy.concatenate(all_clusters), axes=[1,0,2]).reshape((K*self.n_users, self.n_factors))
+
+    def wrong_hard_case_rate(self, valid_dict):
+        fail = 0
+        total = 0
+        for u, cases in enumerate(self.hard_cases):
+            if u in valid_dict:
+                total += len([neg for _, neg, _ in cases.keys()])
+                fail += len([neg for _, neg, _ in cases.keys() if neg in valid_dict[u]])
+        return fail / float(total)
+
+    def initialize(self, train_dict, epoch=1, adagrad=True, profile=False, exclude_items=None):
+        if self.init_f is None:
+            self.check_signature(train_dict)
+            self.sample_generator = self.sample(train_dict, exclude_items)
+            cost, per_sample_losses = self.cost()
+            # do not update
+            self.init_f = theano.function(
+                inputs=[self.triplet, self.sample_weights, self.adagrad],
+                outputs=[cost, per_sample_losses],
+                updates=filter(lambda us: us[0] not in [self.V, self.b, ],
+                               self.gen_updates(cost, per_sample_losses)),
+                profile=profile
+            )
+        if self.warp is not False and self.warp_f is None:
+            self.warp_f = self.warp_func()
+        # perform latent vector updates #
+        epoch_index = 0
+        losses = []
+        sample_time = 0
+        training_time = 0
+        sample_start = time.time()
+        if adagrad:
+            adagrad_val = 1
+        else:
+            adagrad_val = 0
+
+        for triplet in self.sample_generator:
+            sample_time += time.time() - sample_start
+            # update latent vectors
+            training_start = time.time()
+            if self.warp is not False:
+                triplet, weights = self.warp_f(triplet)
+            else:
+                weights = 1.0
+            loss, per_sample_losses = self.init_f(triplet, weights, adagrad_val)
+            print loss
+            losses.append(loss)
+            training_time += time.time() - training_start
+            epoch_index += 1
+            if epoch_index == epoch:
+                sys.stderr.write(
+                    "Train Time: %g Sample Time: %g Loss: %g\n" % (training_time, sample_time, numpy.mean(losses)))
+                sys.stderr.flush()
+                return numpy.mean(losses)
+            sample_start = time.time()
+
+    def __getstate__(self):
+        ret = super(KBPRModel, self).__getstate__()
+        # remove V_feature from the serialization
+        ret["init_f"] = None
+        return ret
+
+    def params(self):
+        return super(KBPRModel, self).params() + [
+            ["margin", self.margin],
+            ["K", self.K],
+            ["l_m_d", self.lambda_mean_distance],
+            ["l_var", self.lambda_variance],
+            ["l_den", self.lambda_density],
+            ["l_cov", self.lambda_cov],
+            ["u_var", self.update_mu],
+            ["u_den", self.update_density],
+            ["chances", self.hard_case_chance],
+            ["mu", self.variance_mu],
+            ["norm", self.normalization],
+            ["warp", self.warp],
+            ["m_norm", self.max_norm]
+        ]
+
+
+
+class ContentBased(Model):
+    def __init__(self, n_users, n_items, V_features, tfidf=False):
+
+        super(ContentBased, self).__init__(n_users, n_items)
+        self.tfidf = tfidf
+        self.V_features = theano.shared(
+            value=V_features.astype(theano.config.floatX),
+            name='V_features',
+            borrow=True
+        )
+
+        # User embedding (optional)
+        self.U_features = None
+
+        self.score_f = None
+    def train(self, train_dict):
+        V_features = self.V_features.get_value()
+        U_features = numpy.zeros((self.n_users, V_features.shape[1])).astype(theano.config.floatX)
+        for i in range(self.n_users):
+            if i in train_dict:
+                U_features[i] = V_features[list(train_dict[i])].sum(0)
+        if self.tfidf:
+            from sklearn.feature_extraction.text import TfidfTransformer
+            transformer = TfidfTransformer()
+            U_features = transformer.fit_transform(U_features).toarray()
+        self.U_features = theano.shared(
+            value=U_features.astype(theano.config.floatX),
+            name='U_features',
+            borrow=True
+        )
+        i = T.lvector()
+        self.score_f = theano.function([i], T.dot(self.U_features[i], self.V_features.T) / T.sqrt(T.sqr(self.V_features).sum(1)).reshape((1, self.n_items)))
+    def scores_for_users(self, users):
+        return self.score_f(users)
+
+
+
+class VisualKBPRAbstract(KBPRModel):
+    def __init__(self, n_factors, n_users, n_items, V_features, U_features=None, items_with_features=None, U=None,
+                 V=None, V_mlp=None,
+                 U_mlp=None,
+                 b=None, K=1, margin=1,
+                 hard_case_margin=-1,
+                 mixture_density=None,
+                 uneven_sample=False,
+                 use_bias=True,
+                 warp=True,
+                 lambda_u=0.0,
+                 lambda_v=0.0,
+                 lambda_bias=0.1,
+                 lambda_mean_distance=0.0,
+                 lambda_variance=1.0,
+                 lambda_density=1.0,
+                 lambda_cov=10,
+                 lambda_weight_l2=0.00001,
+                 lambda_weight_l1=0.0000,
+                 n_layers=2,
+                 variance_mu=1.0,
+                 update_mu=True,
+                 update_density=True,
+                 hard_case_chances=2,
+                 learning_rate=0.01,
+                 per_user_sample=10,
+                 normalization=False,
+                 batch_size=-1,
+                 max_norm=1,
+                 embedding_rescale=0.04,
+                 user_embedding_rescale=0.01,
+                 width=128,
+                 dropout_rate=0.5):
+
+        super(VisualKBPRAbstract, self).__init__(n_factors, n_users, n_items,
+                                                 update_mu=update_mu,
+                                                 update_density=update_density,
+                                                 normalization=normalization,
+                                                 U=U, V=V, b=b, K=K, margin=margin, hard_case_margin=hard_case_margin,
+                                                 mixture_density=mixture_density,
+                                                 use_bias=use_bias,
+                                                 warp=warp,
+                                                 lambda_u=lambda_u,
+                                                 lambda_v=lambda_v,
+                                                 lambda_density=lambda_density,
+                                                 variance_mu=variance_mu,
+                                                 lambda_bias=lambda_bias,
+                                                 lambda_mean_distance=lambda_mean_distance,
+                                                 lambda_variance=lambda_variance,
+                                                 uneven_sample=uneven_sample,
+                                                 hard_case_chances=hard_case_chances,
+                                                 learning_rate=learning_rate,
+                                                 per_user_sample=per_user_sample,
+                                                 batch_size=batch_size,
+                                                 max_norm=max_norm,
+                                                 lambda_cov=lambda_cov,
+
+                                                 )
+        self.width = width
+        self.dropout_rate = dropout_rate
+        import theano.sparse
+        import scipy.sparse
+        def to_tensor(m, name):
+            if scipy.sparse.issparse(m):
+                return theano.sparse.shared(
+                    value=m,
+                    name=name,
+                    borrow=True
+                    )
+            else:
+                return theano.shared(
+                    value=m.astype(theano.config.floatX),
+                    name=name,
+                    borrow=True
+                    )
+
+        self.V_features = to_tensor(V_features, "V_features")
+        # item embedding (optional)
+        if items_with_features is None:
+            self.items_with_features = numpy.arange(n_items)
+        else:
+            self.items_with_features = numpy.asarray(items_with_features, dtype="int64")
+
+        if V_mlp is None:
+            self.V_mlp = MLP(V_features.shape[1], self.n_factors, T.cast(self.n_items, "float32"),
+                             lambda_weight_l1=lambda_weight_l1,
+                             lambda_weight_l2=lambda_weight_l2, n_layers=n_layers, width=width)
+        else:
+            self.V_mlp = V_mlp.copy()
+            self.V_mlp.usage_count = T.cast(self.n_items, "float32")
+        self.embedding_rescale = embedding_rescale
+        self.V_embedding = self.V_mlp.projection(self.V_features, self.embedding_rescale, self.max_norm,
+                                                 dropout_rate=self.dropout_rate, training=True)
+
+        # User embedding (optional)
+        if U_features is not None:
+            self.U_features = to_tensor(U_features, "U_features")
+
+            if U_mlp is None:
+                self.U_mlp = MLP(U_features.shape[1], n_factors, T.cast(self.n_users, "float32"),
+                                 lambda_weight_l1=lambda_weight_l1,
+                                 lambda_weight_l2=lambda_weight_l2, n_layers=n_layers, width=width)
+            else:
+                self.U_mlp = U_mlp.copy()
+                self.U_mlp.usage_count = T.cast(self.n_users, "float32")
+            self.user_embedding_rescale = user_embedding_rescale
+            self.U_embedding = self.U_mlp.projection(self.U_features, self.user_embedding_rescale, self.max_norm,
+                                                     dropout_rate=self.dropout_rate, training=True)
+        else:
+            self.U_features = None
+            self.U_embedding = None
+            self.U_mlp = None
+
+    def l2_reg(self):
+        reg = super(VisualKBPRAbstract, self).l2_reg()
+        if self.U_mlp is not None:
+            reg += self.U_mlp.l2_reg()
+        reg += self.V_mlp.l2_reg()
+        return reg
+
+    def l1_reg(self):
+        reg = super(VisualKBPRAbstract, self).l1_reg()
+        if self.U_mlp is not None:
+            reg += self.U_mlp.l1_reg()
+        reg += self.V_mlp.l1_reg()
+        return reg
+
+    def __getstate__(self):
+        ret = super(VisualKBPRAbstract, self).__getstate__()
+        # remove V_feature from the serialization
+        ret["V_features"] = None
+        ret["V_embedding"] = None
+        ret["U_features"] = None
+        ret["U_embedding"] = None
+        return ret
+
+
+
+class VisualFactorKBPR(VisualKBPRAbstract):
+    def __init__(self, n_factors, n_users, n_items, V_features, U_features=None, items_with_features=None, U=None,
+                 V=None, V_mlp=None,
+                 U_mlp=None, b=None, K=1, margin=1,
+                 hard_case_margin=-1,
+                 mixture_density=None,
+                 uneven_sample=False,
+                 use_bias=True,
+                 warp=True,
+                 lambda_u=0.0,
+                 lambda_v=0.0,
+                 lambda_bias=0.1,
+                 lambda_mean_distance=0.0,
+                 lambda_variance=1.0,
+                 lambda_density=1.0,
+                 lambda_cov=10,
+                 n_layers=2,
+                 lambda_weight_l2=0.00001,
+                 lambda_weight_l1=0.00001,
+                 variance_mu=1.0,
+                 update_mu=True,
+                 update_density=True,
+                 hard_case_chances=2,
+                 learning_rate=0.01,
+                 per_user_sample=10,
+                 normalization=False,
+                 batch_size=-1,
+                 max_norm=1,
+                 lambda_v_off=0.1,
+                 embedding_rescale=0.04,
+                 user_embedding_rescale=0.01,
+                 width=128,
+                 dropout_rate=0.5):
+
+        super(VisualFactorKBPR, self).__init__(n_factors, n_users, n_items, V_features, U_features,
+                                               items_with_features=items_with_features,
+                                               update_mu=update_mu,
+                                               update_density=update_density,
+                                               normalization=normalization,
+                                               U=U, V=V, b=b, K=K, margin=margin,
+                                               hard_case_margin=hard_case_margin,
+                                               mixture_density=mixture_density,
+                                               use_bias=use_bias,
+                                               warp=warp,
+                                               lambda_u=lambda_u,
+                                               lambda_v=lambda_v,
+                                               lambda_density=lambda_density,
+                                               lambda_weight_l2=lambda_weight_l2,
+                                               lambda_weight_l1=lambda_weight_l1,
+                                               n_layers=n_layers,
+                                               variance_mu=variance_mu,
+                                               lambda_bias=lambda_bias,
+                                               lambda_mean_distance=lambda_mean_distance,
+                                               lambda_variance=lambda_variance,
+                                               uneven_sample=uneven_sample,
+                                               hard_case_chances=hard_case_chances,
+                                               learning_rate=learning_rate,
+                                               per_user_sample=per_user_sample,
+                                               batch_size=batch_size,
+                                               max_norm=max_norm,
+                                               lambda_cov=lambda_cov,
+                                               V_mlp=V_mlp,
+                                               embedding_rescale=embedding_rescale,
+                                               user_embedding_rescale=user_embedding_rescale,
+                                               width=width,
+                                               dropout_rate=dropout_rate,
+                                               U_mlp=U_mlp)
+
+        self.lambda_v_off = lambda_v_off
+        self.update_f = None
+        # initialize V as feature embedding value if V is not given
+        if V is None:
+            theano.function([], [], updates=[[self.V, self.V_embedding(numpy.arange(n_items))]])()
+        if U is None and self.U_embedding is not None:
+            embedding = self.U_embedding(numpy.arange(n_users))
+            theano.function([], [], updates=[[self.U, T.concatenate([embedding] * self.K)]])()
+
+
+    def cov_penalty_vectors(self):
+        return super(VisualFactorKBPR, self).cov_penalty_vectors() #+ [self.V_embedding]
+
+    def params(self):
+        return super(VisualFactorKBPR, self).params() + [
+            ["l_v_off", self.lambda_v_off]
+        ]
+
+    def updates(self):
+        updates = super(VisualFactorKBPR, self).updates()
+        updates += self.V_mlp.updates()
+        if self.U_embedding is not None:
+            updates += self.U_mlp.updates()
+
+        return updates
+
+    def l2_reg(self):
+        reg = super(VisualFactorKBPR, self).l2_reg()
+        has_features = (self.V_features ** 2).sum(1).nonzero()
+        reg += [[(self.V - self.V_embedding(numpy.arange(self.n_items)))[has_features], self.lambda_v_off]]
+        #reg += [[(self.U[self.i] - self.V_embedding[self.j_pos]), 0.0001, 1]]
+        if self.U_embedding is not None:
+            if self.K == 1:
+                reg += [
+                    [(self.U - self.U_embedding(numpy.arange(self.n_users))),
+                     self.lambda_v_off]]
+            else:
+
+                embedding = self.U_embedding(numpy.arange(self.n_users))
+                reg += [[(self.U - T.concatenate([embedding] * self.K)), self.lambda_v_off]]
+
+            #reg += [[(self.U_embedding[self.i] - self.V_embedding[self.j_pos]), 0.0001, 1]]
+
+        return reg
+
+    def train(self, train_dict, epoch=1, adagrad=False, hard_case=False, profile=False, exclude_items=None):
+        ret = super(VisualFactorKBPR, self).train(train_dict, epoch=epoch, adagrad=adagrad,
+                                                  hard_case=hard_case, profile=profile, exclude_items=exclude_items)
+        if exclude_items is not None and len(exclude_items) > 0:
+            if self.update_f is None:
+                print "Use non-dropout version"
+                self.V_embedding = self.V_mlp.projection(self.V_features, self.embedding_rescale, self.max_norm,
+                                                         dropout_rate=self.dropout_rate,
+                                                         training=False)
+                exclude_items = numpy.asarray(list(exclude_items))
+                updates = [[self.V, T.set_subtensor(self.V[exclude_items], self.V_embedding[exclude_items])]]
+
+                self.update_f = theano.function([], [], updates=updates)
+            self.update_f()
+        return ret
+
+    def __getstate__(self):
+        ret = super(VisualFactorKBPR, self).__getstate__()
+        ret["update_f"] = None
+        return ret
+
+
+class VisualOnlyKBPR(VisualKBPRAbstract):
+    def __init__(self, n_factors, n_users, n_items, V_features, items_with_features, U=None, V_mlp=None, b=None, K=1,
+                 margin=1,
+                 hard_case_margin=-1,
+                 mixture_density=None,
+                 uneven_sample=False,
+                 use_bias=True,
+                 warp=True,
+                 lambda_u=0.0,
+                 lambda_v=0.0,
+                 lambda_bias=0.1,
+                 lambda_mean_distance=0.0,
+                 lambda_variance=1.0,
+                 lambda_density=1.0,
+                 lambda_cov=10,
+                 lambda_weight_l2=0.00001,
+                 lambda_weight_l1=0.00001,
+                 n_layers=2,
+                 variance_mu=1.0,
+                 update_mu=True,
+                 update_density=True,
+                 hard_case_chances=2,
+                 learning_rate=0.01,
+                 per_user_sample=10,
+                 normalization=False,
+                 batch_size=-1,
+                 max_norm=1,
+                 lambda_v_off=0.1,
+                 embedding_rescale=0.04):
+        super(VisualOnlyKBPR, self).__init__(n_factors, n_users, n_items, V_features,
+                                             items_with_features=items_with_features,
+                                             update_mu=update_mu,
+                                             update_density=update_density,
+                                             normalization=normalization,
+                                             U=U, V=None, b=b, K=K, margin=margin,
+                                             hard_case_margin=hard_case_margin,
+                                             mixture_density=mixture_density,
+                                             use_bias=use_bias,
+                                             warp=warp,
+                                             lambda_u=lambda_u,
+                                             lambda_v=lambda_v,
+                                             lambda_density=lambda_density,
+                                             lambda_weight_l2=lambda_weight_l2,
+                                             lambda_weight_l1=lambda_weight_l1,
+                                             n_layers=n_layers,
+                                             variance_mu=variance_mu,
+                                             lambda_bias=lambda_bias,
+                                             lambda_mean_distance=lambda_mean_distance,
+                                             lambda_variance=lambda_variance,
+                                             uneven_sample=uneven_sample,
+                                             hard_case_chances=hard_case_chances,
+                                             learning_rate=learning_rate,
+                                             per_user_sample=per_user_sample,
+                                             batch_size=batch_size,
+                                             max_norm=max_norm,
+                                             lambda_cov=lambda_cov,
+                                             V_mlp=V_mlp,
+                                             embedding_rescale=embedding_rescale)
+
+        self.lambda_v_off = lambda_v_off
+        # initialize V as feature embedding value if V is not given
+        self.V = self.V_embedding
+
+    def updates(self):
+        updates = super(VisualOnlyKBPR, self).updates()
+        updates = filter(lambda u: u[0] != self.V, updates)
+        updates += self.V_mlp.updates()
+        return updates
+
+    def l2_reg(self):
+        reg = super(VisualOnlyKBPR, self).l2_reg()
+
+        return reg
+
+
+class MaxMF(KBPRModel):
+    def __init__(self, n_factors, n_users, n_items, U=None, V=None, b=None, K=2, margin=1, hard_case_margin=-1,
+                 mixture_density=None,
+                 use_bias=False,
+                 warp=True,
+                 lambda_u=0.1,
+                 lambda_v=0.1,
+                 lambda_bias=0.1,
+                 hard_case_chances=2,
+                 learning_rate=0.01,
+                 uneven_sample=False,
+                 per_user_sample=10,
+                 lambda_cov=0.0,
+                 max_norm=numpy.Infinity,
+                 batch_size=-1):
+        super(MaxMF, self).__init__(n_factors, n_users, n_items,
+                                    update_mu=False,
+                                    update_density=False,
+                                    normalization=False,
+                                    bias_init=0.0,
+                                    bias_range=(-numpy.Infinity, numpy.Infinity),
+                                    U=U, V=V, b=b, K=K, margin=margin, hard_case_margin=hard_case_margin,
+                                    mixture_density=mixture_density,
+                                    use_bias=use_bias,
+                                    warp=warp,
+                                    lambda_u=lambda_u,
+                                    lambda_v=lambda_v,
+                                    lambda_bias=lambda_bias,
+                                    lambda_mean_distance=0.0,
+                                    lambda_variance=0.0,
+                                    uneven_sample=uneven_sample,
+                                    hard_case_chances=hard_case_chances,
+                                    learning_rate=learning_rate,
+                                    per_user_sample=per_user_sample,
+                                    batch_size=batch_size,
+                                    max_norm=max_norm,
+                                    lambda_cov=lambda_cov
+                                    )
+
+    def assign_cluster(self, i, j):
+        return (self.U_norm_wide[:, i, :] * self.V_norm[j]).sum(axis=2).argmax(axis=0) * self.n_users + i
+
+
+    def factor_delta(self):
+        pos_i = self.assign_cluster(self.i, self.j_pos)
+        neg_i = self.assign_cluster(self.i, self.j_neg)
+        return ((self.U_norm[pos_i, :] * self.V_norm[self.j_pos]) -
+                (self.U_norm[neg_i, :] * self.V_norm[self.j_neg])).sum(axis=1)
+
+    def bias_delta(self):
+        if self.use_bias:
+            return self.b[self.j_pos, 0] - self.b[self.j_neg, 0]
+        return 0
+
+    def scores_ij(self, i, j):
+        i_cluster = self.assign_cluster(i, j)
+        scores = (self.U_norm[i_cluster, :] * self.V_norm[j]).sum(axis=1)
+        if self.use_bias:
+            scores += self.b[j, 0]
+        return scores
+
+    def bias_score(self):
+        if self.use_bias:
+            return self.b.reshape((self.n_items,))
+        return 0
+
+    def factor_score(self):
+        # (items, K, users)
+        scores = (self.U_norm_wide[:, self.i, :] * self.V_norm.reshape((self.n_items, 1, 1, self.n_factors))).sum(
+            axis=3)
+        return scores.max(axis=1).T
+
+
+
+class KNormalBPRModel(KBPRModel):
     def __init__(self, n_factors, n_users, n_items, U=None, V=None, b=None, K=2, margin=1, hard_case_margin=-1,
                  mixture_density=None,
                  uneven_sample=False,
                  use_bias=False,
-                 use_warp=True,
+                 warp=True,
                  lambda_u=0.1,
                  lambda_v=0.1,
                  lambda_bias=0.1,
@@ -1384,468 +2372,40 @@ class KBPRModel(BPRModel):
                  bias_range=(1E-6, 1),
                  batch_size=1000,
                  max_norm=1):
-        if U is None:
-            U = numpy.random.normal(0, 1 / (n_factors ** 0.5), (n_users * K, n_factors)).astype(theano.config.floatX)
 
-        BPRModel.__init__(self, n_factors, n_users, n_items, U, V, b, lambda_u, lambda_v, lambda_bias,
-                          use_bias,
-                          True,
-                          learning_rate,
-                          per_user_sample,
-                          bias_init=bias_init, bias_range=bias_range,)
-        self.K = K
-        self.margin = margin
-        self.lambda_mean_distance = lambda_mean_distance
-        self.lambda_variance = lambda_variance
-        self.lambda_density = lambda_density
-        self.lambda_cov = lambda_cov
-        self.update_mu = update_mu
-        self.hard_case_chance = hard_case_chances
-        self.use_warp = use_warp
-        self.uneven_sample = uneven_sample
-        self.update_density = update_density
-        self.normalization = normalization
-        self.hard_cases = [dict() for _ in range(n_users)]
-        self.hard_case_margin = hard_case_margin
-        self.pos_sample_count = None
-        self.variance_mu = variance_mu
-        self.trials = None
-        self.batch_size = batch_size
-        self.max_norm = max_norm
-        if mixture_density is None:
-            self.mixture_density = theano.shared(
-                value=numpy.zeros((K - 1, n_users)).astype(theano.config.floatX) + (1.0 / K),
-                name='U_mixture_portion',
-                borrow=True
-            )
-        else:
-            self.mixture_density = theano.shared(
-                value=mixture_density,
-                name='U_mixture_portion',
-                borrow=True
-            )
+        super(KNormalBPRModel, self).__init__(n_factors, n_users, n_items,
+                                              update_mu=update_mu,
+                                              update_density=update_density,
+                                              normalization=normalization,
+                                              bias_init=bias_init,
+                                              bias_range=bias_range,
+                                              U=U, V=V, b=b, K=K, margin=margin, hard_case_margin=hard_case_margin,
+                                              mixture_density=mixture_density,
+                                              use_bias=use_bias,
+                                              warp=warp,
+                                              lambda_u=lambda_u,
+                                              lambda_v=lambda_v,
+                                              lambda_bias=lambda_bias,
+                                              lambda_mean_distance=lambda_mean_distance,
+                                              lambda_variance=lambda_variance,
+                                              uneven_sample=uneven_sample,
+                                              hard_case_chances=hard_case_chances,
+                                              learning_rate=learning_rate,
+                                              per_user_sample=per_user_sample,
+                                              batch_size=batch_size,
+                                              lambda_density=lambda_density,
+                                              lambda_cov=lambda_cov,
+                                              variance_mu=variance_mu,
+                                              max_norm=max_norm)
 
-        self.mixture_variance = theano.shared(
-            value=numpy.zeros((K, n_users)).astype(theano.config.floatX) + self.variance_mu,
-            name='variance',
-            borrow=True
-        )
-
-        if normalization:
-            self.V_norm = self.normalize(self.V)
-            self.U_norm = self.normalize(self.U)
-        else:
-            self.V_norm = self.V
-            self.U_norm = self.U
-
-        self.U_norm_wide = self.U_norm.reshape((self.K, self.n_users, self.n_factors))
-        self.mixture_variance_long = self.mixture_variance.reshape((self.K * self.n_users, 1))
-        first_mixture_portion = T.maximum(0, (1 - T.maximum(0, self.mixture_density).sum(axis=0))).reshape(
-            (1, n_users))
-        self.log_mixture_density_wide = T.log(
-            T.concatenate((first_mixture_portion, T.maximum(0, self.mixture_density)), axis=0) + 0.001)
-        self.log_mixture_density_long = self.log_mixture_density_wide.reshape((self.K * self.n_users, 1))
-
-        self.pos_i = self.assign_cluster(self.i, self.j_pos)
-        self.neg_i = self.assign_cluster(self.i, self.j_neg)
-
-        # for those samples that do not appear in the triplet, set the count to -1
-        minus1 = T.zeros((self.n_users * self.K, 1), theano.config.floatX) - 1
-        self.unique_i = theano.tensor.extra_ops.Unique()(T.concatenate((self.pos_i, self.neg_i)))
-
-        one = numpy.asarray([1.0], dtype="float32").reshape((1, 1))
-
-        # for those samples that do appear in the triplet, set the count to 0 first
-        self.user_sample_counts_with_minus = T.inc_subtensor(minus1[self.unique_i, :], one)
-        # add counts
-        self.user_sample_counts_with_minus = T.inc_subtensor(self.user_sample_counts_with_minus[self.pos_i, :], one)
-        self.user_sample_counts_with_minus = T.inc_subtensor(self.user_sample_counts_with_minus[self.neg_i, :], one)
-        # add counts
-        self.user_sample_counts =  T.inc_subtensor(self.user_sample_counts_with_minus[self.unique_i, :], -one) + 1
-
-    def censor_updates(self):
-        return super(KBPRModel, self).censor_updates() + [[self.V, self.max_norm], [self.U, self.max_norm]]
-
-    def updates(self):
-        updates = super(KBPRModel, self).updates()
-
-        def fix(x):
-            return T.minimum(1, T.maximum(0, x))
-        if self.update_density and self.K > 1:
-            updates += [[self.mixture_density, self.per_user_sample, fix]]
-        if self.update_mu:
-            updates += [[self.mixture_variance, self.user_sample_counts_with_minus.reshape((self.K, self.n_users))]]
-        return updates
-
-    def l2_reg(self):
-        reg = super(KBPRModel, self).l2_reg()
-        reg += [[(self.mixture_variance - self.variance_mu), self.lambda_variance, self.user_sample_counts.reshape((self.K, self.n_users))]]
-        reg += [[self.cov_penalty(T.concatenate((self.V[self.unique_j], self.U[self.unique_i]))), self.lambda_cov, 1.0]]
-        if self.K > 1:
-            reg += [[(self.mixture_density - (1.0 / self.K)), self.lambda_density, self.per_user_sample]]
-        for i in range(self.K):
-            for j in range(i + 1, self.K):
-                reg += [[self.U_norm_wide[i] - self.U_norm_wide[j],
-                         self.lambda_mean_distance, self.per_user_sample]]
-        return reg
-
-    def cov_penalty(self, X):
-        X = X - (X.sum(axis=0) / T.cast(X.shape[0], theano.config.floatX))
-        return T.fill_diagonal(T.dot(X.T, X) / T.cast(X.shape[0], theano.config.floatX) , T.cast(0, theano.config.floatX))
-
-
-    def assign_cluster(self, i, j):
-        distance = ((self.U_norm_wide[:, i, :] - self.V_norm[j]) ** 2).sum(axis=2)
-        normal = -(distance / (2 * (self.mixture_variance[:, i] ** 2))) - (
-            T.log(self.mixture_variance[:, i] ** 2) / 2)
-        return (normal + self.log_mixture_density_wide[:, i]).argmax(
-            axis=0) * self.n_users + i
-
-    def factor_delta(self):
-        pos_j = self.pos_i
-        neg_j = self.neg_i
-        pos_distance = ((self.U_norm[pos_j, :] - self.V_norm[self.j_pos]) ** 2).sum(axis=1)
-        pos_distance_p = -(pos_distance / (2 * (self.mixture_variance_long[pos_j, 0] ** 2))) - (
-            T.log(self.mixture_variance_long[pos_j, 0] ** 2) / 2) + self.log_mixture_density_long[pos_j, 0]
-
-        neg_distance = ((self.U_norm[neg_j, :] - self.V_norm[self.j_neg]) ** 2).sum(axis=1)
-        neg_distance_p = -(neg_distance / (2 * (self.mixture_variance_long[neg_j, 0] ** 2))) - (
-            T.log(self.mixture_variance_long[neg_j, 0] ** 2) / 2) + self.log_mixture_density_long[neg_j, 0]
-
-        return pos_distance_p - neg_distance_p
-
-    def bias_delta(self):
-        if self.use_bias:
-            return T.log(self.b[self.j_pos, 0]) - T.log(self.b[self.j_neg, 0])
-        return 0
-
-    def bias_score(self):
-        if self.use_bias:
-            return T.log(self.b).reshape((self.n_items,))
-        return 0
-
-    def factor_score(self):
-        variance = self.mixture_variance.reshape((1, self.K, self.n_users))
-        portion = self.log_mixture_density_wide.reshape((1, self.K, self.n_users))
-        v_norm_wide = self.V_norm.reshape((self.n_items, 1, 1, self.n_factors))  # (items, 1, ,1, factors)
-        distance = ((self.U_norm_wide[:, self.i, :] - v_norm_wide) ** 2).sum(axis=3)  # (items, K, users)
-        normal = -(distance / (2 * (variance[:, :, self.i] ** 2))) - (T.log(variance[:, :, self.i] ** 2) / 2)
-        return (normal + portion[:, :, self.i]).max(axis=1).T  # transpose (items, users) to (users, items)
-
-    def kmean(self, train_dict, K, learning_rate=1, normalize=True):
-        # variables
-        clusters = theano.shared(
-            numpy.random.normal(0, 1 / (self.n_factors ** 0.5), (self.n_users * K, self.n_factors)).astype(
-                theano.config.floatX))
-        if normalize:
-            clusters_norm = self.normalize(clusters)
-        else:
-            clusters_norm = clusters
-        gradient_history = theano.shared(
-            numpy.zeros((self.n_users * K, self.n_factors)).astype(theano.config.floatX))
-        prev_cost = theano.shared(numpy.cast['float32'](numpy.Infinity))
-
-        # positive samples
-        tuples = []
-        sample_counts = []
-        for u, items in train_dict.items():
-            for i in items:
-                tuples.append((u, i, 0))
-                sample_counts.append(float(len(items)))
-        sample_counts = numpy.asarray(sample_counts, theano.config.floatX)
-
-        # theano function
-        clusters_norm_wide = clusters_norm.reshape((K, self.n_users, self.n_factors))
-        distance = ((clusters_norm_wide[:, self.i, :] - self.V_norm[self.j_pos]) ** 2).sum(axis=2)
-        assign = distance.argmin(axis=0) * self.n_users + self.i
-        cost = (((clusters_norm[assign] - self.V_norm[self.j_pos]) ** 2).sum(axis=1) / sample_counts).sum()
-
-        # adagrad
-        gradient = T.grad(cost, wrt=clusters)
-        new_history = gradient_history + (gradient ** float(2))
-        adjusted_grad = gradient / ((new_history ** float(0.5)) + float(1e-10))
-        f = theano.function([self.triplet], [cost, (prev_cost - cost) / prev_cost], updates=[
-            [prev_cost, cost],
-            [gradient_history, new_history],
-            [clusters, clusters - (adjusted_grad * float(learning_rate))]])
-        i = 0
-        while True:
-            i += 1
-            cur_cost, diff = f(tuples)
-            print ("Iter %d, Cost %g, Converge %g" % (i, cur_cost, diff))
-            if abs(diff) < 1e-6:
-                break
-        return clusters.get_value()
-
-    def loss(self, delta):
-        ret = T.maximum(0, self.margin - delta)
-        if self.use_warp:
-            log_rank = T.log(float(self.n_items) / (self.trials[self.triplet[:, 3], 0] + 1)) / T.log(float(self.n_items))
-            ret *= T.maximum(1E-3, log_rank)
-
-        return ret
-
-    def sample_uneven(self, train_dict):
-        users, items = dict_to_coo(train_dict, self.n_users, self.n_items).nonzero()
-        triplet = numpy.zeros((len(users), 4), "int64")
-
-        triplet[:,0] = users
-        triplet[:,1] = items
-        triplet[:,3] = numpy.arange(len(users))
-
-
-        while True:
-            triplet[:,2] = numpy.random.randint(0, self.n_items, size=len(users))
-            for i in xrange(len(users)):
-                while triplet[i, 2] in train_dict[triplet[i, 0]]:
-                    triplet[i, 2] = numpy.random.randint(0, self.n_items)
-            yield triplet
-
-    def train_hard(self, triplet, adagrad_val):
-        total_hard = 0
-        hard_case_loc = []
-
-        for index, (u, pos, neg, id) in enumerate(triplet):
-
-            hard_cases = self.hard_cases[u]
-            if len(hard_cases) > 0:
-                all_hard_cases = numpy.asarray(hard_cases.keys())
-                if len(hard_cases) < self.per_user_sample:
-                    triplet[index, 1:4] = all_hard_cases
-                    hard_case_loc.extend(range(base, base + len(hard_cases)))
-                    total_hard += len(hard_cases)
-                else:
-                    samples_index = numpy.random.choice(range(len(hard_cases)), replace=False,
-                                                        size=self.per_user_sample)
-                    triplet[base:base + self.per_user_sample, 1:4] = all_hard_cases[samples_index]
-                    hard_case_loc.extend(range(base, base + self.per_user_sample))
-                    total_hard += self.per_user_sample
-
-        print "Hard Sample Cases:" + str(total_hard)
-        loss, per_sample_losses = self.f(triplet, adagrad_val)
-        per_sample_losses_real = -(per_sample_losses - self.margin)
-
-        threshold = numpy.percentile(per_sample_losses_real[per_sample_losses_real < self.hard_case_margin], 20)
-        # add hard case
-        hard_triplet = triplet[(per_sample_losses_real < self.hard_case_margin) & (per_sample_losses_real > threshold)]
-        for u, pos, neg, id in hard_triplet:
-            case = (pos, neg, id)
-            hard_cases = self.hard_cases[u]
-            if case in hard_cases:
-                hard_cases[case] += 1
-                if hard_cases[case] > self.hard_case_chance:
-                    del hard_cases[case]
-            else:
-                hard_cases[case] = 1
-        # remove cases that are not hard any more
-        for loc in hard_case_loc:
-            if per_sample_losses_real[loc] > self.hard_case_margin or per_sample_losses_real[loc] < threshold:
-                u, pos, neg, id = triplet[loc]
-                hard_cases = self.hard_cases[u]
-                del hard_cases[(pos, neg, id)]
-
-        return loss, per_sample_losses
-
-    def gen_updates(self, cost, per_sample_losses):
-        all_cases = self.triplet[:, 3]
-        violated_cases = self.triplet[per_sample_losses > 0, 3]
-
-        new_trials = T.inc_subtensor(self.trials[all_cases, :], 1.0)
-        new_trials = T.set_subtensor(new_trials[violated_cases, :], 0)
-
-        return super(KBPRModel, self).gen_updates(cost, per_sample_losses) + \
-               [[self.trials, new_trials]]
-
-    def train(self, train_dict, epoch=1, adagrad=False, hard_case=False, profile=False):
-        if self.train_dict != train_dict:
-            self.train_dict = train_dict
-
-            if self.uneven_sample:
-                self.sample_generator = self.sample_uneven(train_dict)
-            else:
-                self.sample_generator = self.sample(train_dict)
-
-            self.f = None
-            self.pos_sample_count = reduce(lambda a, items: a + len(items), train_dict.values(), 0)
-            self.trials = theano.shared(numpy.zeros((self.pos_sample_count, 1)), theano.config.floatX)
-
-        if self.f is None:
-            cost, per_sample_losses = self.cost()
-            self.f = theano.function(
-                inputs=[self.triplet, self.adagrad, self.unique_j],
-                outputs=[cost, per_sample_losses],
-                updates=self.gen_updates(cost, per_sample_losses),
-                profile=profile
-            )
-        # perform latent vector updates #
-        epoch_index = 0
-        losses = []
-        sample_time = 0
-        training_time = 0
-        sample_start = time.time()
-        if adagrad:
-            adagrad_val = 1
-        else:
-            adagrad_val = 0
-        for triplet, unique_i, unique_j in self.sample_generator:
-            sample_time += time.time() - sample_start
-            # update latent vectors
-            training_start = time.time()
-            if hard_case:
-                loss, per_sample_losses = self.train_hard(triplet,  adagrad_val)
-            else:
-                if self.batch_size > 0:
-                    indices = numpy.split(numpy.random.permutation(len(triplet)), numpy.arange(self.batch_size, len(triplet), self.batch_size))
-                    for index in indices:
-                        if len(index) > 0:
-                            loss, per_sample_losses = self.f(triplet[index], adagrad_val)
-                else:
-                    loss, per_sample_losses = self.f(triplet, adagrad_val, unique_j)
-            losses.append(loss)
-            print numpy.sum(per_sample_losses > 0) / float(len(per_sample_losses))
-
-            training_time += time.time() - training_start
-            epoch_index += 1
-            if epoch_index == epoch:
-                sys.stderr.write(
-                    "Train Time: %g Sample Time: %g\n" % (training_time, sample_time))
-                sys.stderr.flush()
-                return numpy.mean(losses)
-            sample_start = time.time()
-
-    def wrong_hard_case_rate(self, valid_dict):
-        fail = 0
-        total = 0
-        for u, cases in enumerate(self.hard_cases):
-            if u in valid_dict:
-                total += len([neg for _, neg, _ in cases.keys()])
-                fail += len([neg for _, neg, _ in cases.keys() if neg in valid_dict[u]])
-        return fail / float(total)
-
-    def params(self):
-        return super(KBPRModel, self).params() + [
-            ["margin", self.margin],
-            ["K", self.K],
-            ["l_m_d", self.lambda_mean_distance],
-            ["l_var", self.lambda_variance],
-            ["l_den", self.lambda_density],
-            ["l_cov", self.lambda_cov],
-            ["u_var", self.update_mu],
-            ["u_den", self.update_density],
-            ["chances", self.hard_case_chance],
-            ["mu", self.variance_mu],
-            ["norm", self.normalization],
-            ["warp", self.use_warp]
-        ]
-
-    def copy(self):
-        z = super(KBPRModel, self).copy()
-        z.update(
-            {
-                "normalization": self.normalization,
-                "margin": self.margin,
-                "user_warp": self.use_warp,
-                "K": self.K,
-                "lambda_mean_distance": self.lambda_mean_distance,
-                "lambda_variance": self.lambda_variance,
-                "lambda_density": self.lambda_density,
-                "lambda_cov": self.lambda_cov,
-                "variance_mu_mu": self.variance_mu,
-                "mixture_density": self.mixture_density.get_value(),
-                "mixture_variance": self.mixture_variance.get_value()
-            }
-        )
-        return z
-
-class MaxMF(KBPRModel):
-    def __init__(self, n_factors, n_users, n_items, U=None, V=None, b=None, K=2, margin=1, hard_case_margin=-1,
-                 mixture_density=None,
-                 use_bias=False,
-                 use_warp=True,
-                 lambda_u=0.1,
-                 lambda_v=0.1,
-                 lambda_bias=0.1,
-                 hard_case_chances=2,
-                 learning_rate=0.01,
-                 uneven_sample=False,
-                 per_user_sample=10,
-                 batch_size=-1):
-        super(MaxMF, self).__init__(n_factors, n_users, n_items,
-                                    update_mu=False,
-                                    update_density=False,
-                                    normalization=False,
-                                    bias_init=0.0,
-                                    bias_range=(-numpy.Infinity, numpy.Infinity),
-                                    U=U, V=V, b=b, K=K, margin=margin, hard_case_margin=hard_case_margin,
-                                    mixture_density=mixture_density,
-                                    use_bias=use_bias,
-                                    use_warp=use_warp,
-                                    lambda_u=lambda_u,
-                                    lambda_v=lambda_v,
-                                    lambda_bias=lambda_bias,
-                                    lambda_mean_distance=0.0,
-                                    lambda_variance=0.0,
-                                    uneven_sample=uneven_sample,
-                                    hard_case_chances=hard_case_chances,
-                                    learning_rate=learning_rate,
-                                    per_user_sample=per_user_sample,
-                                    batch_size=batch_size)
-
-    def assign_cluster(self, i, j):
-        return (self.U_norm_wide[:, i, :] * self.V_norm[j]).sum(axis=2).argmax(axis=0) * self.n_users + i
-
-    def factor_delta(self):
-        pos_j = self.assign_cluster(self.i, self.j_pos)
-        neg_j = self.assign_cluster(self.i, self.j_neg)
-        return ((self.U_norm[pos_j, :] * self.V_norm[self.j_pos]) -
-                (self.U_norm[neg_j, :] * self.V_norm[self.j_neg])).sum(axis=1)
-
-    def bias_delta(self):
-        if self.use_bias:
-            return self.b[self.j_pos, 0] - self.b[self.j_neg, 0]
-        return 0
-
-    def bias_score(self):
-        if self.use_bias:
-            return self.b.reshape((self.n_items,))
-        return 0
-
-    def factor_score(self):
-        # (items, K, users)
-        scores = (self.U_norm_wide[:, self.i, :] * self.V_norm.reshape((self.n_items, 1, 1, self.n_factors))).sum(axis=3)
-        return scores.max(axis=1).T
-
-
-class KNormalBPRModel(KBPRModel):
-    def __init__(self, n_factors, n_users, n_items, U=None, V=None, K=2, margin=1, U_mixture_portion=None,
-                 lambda_u=0.1,
-                 lambda_mean_distance=10.0,
-                 lambda_variance=1.0,
-                 lambda_density=1.0,
-                 variance_mu=1.0,
-                 update_mu=True,
-                 learning_rate=0.01,
-                 per_user_sample=10):
-
-        super(KNormalBPRModel, self).__init__(
-            n_factors, n_users, n_items,
-            U=U, V=V, K=K, margin=margin,
-            U_mixture_portion=U_mixture_portion,
-            lambda_u=lambda_u,
-            lambda_mean_distance=lambda_mean_distance,
-            lambda_variance=lambda_variance,
-            lambda_density=lambda_density,
-            variance_mu=variance_mu,
-            update_mu=update_mu,
-            learning_rate=learning_rate,
-            per_user_sample=per_user_sample)
 
     def prob(self, i, j, k):
         i = k * self.n_users + i
         log_density = self.log_mixture_density_long[i, 0]
         mu = (self.mixture_variance_long[i, 0])
-        norm = T.exp(-((self.U_norm[i, :] - self.V_norm[j, :]) ** 2).sum(axis=1) / (2 * (mu ** 2)) + log_density)
+        norm = T.exp(-((self.U_norm[i, :] - self.V_norm[j, :]) ** 2).sum(axis=1) / (2 * (mu ** 2)))
         norm /= mu
+        norm *= T.exp(log_density)
         return norm
 
     def factor_score(self):
@@ -1854,9 +2414,9 @@ class KNormalBPRModel(KBPRModel):
         V = self.V_norm.reshape((self.n_items, 1, 1, self.n_factors))  # (items, 1, ,1, factors)
         U = self.U_norm_wide[:, self.i, :]  # (K, users, factors)
         distance = ((U - V) ** 2).sum(axis=3)  # (items, K, users)
-        return (T.exp(-distance / (2 * (mu ** 2)) + log_density) / mu).sum(axis=1).T  # (user, items)
+        return (T.exp(-distance / (2 * (mu ** 2))) / mu * T.exp(log_density)).sum(axis=1).T  # (user, items)
 
-    def delta(self):
+    def factor_delta(self):
         pos_distance = self.prob(self.i, self.j_pos, 0)
         for i in range(1, self.K):
             pos_distance += self.prob(self.i, self.j_pos, i)
@@ -1866,27 +2426,94 @@ class KNormalBPRModel(KBPRModel):
         return T.log(pos_distance) - T.log(neg_distance)
 
 
-import multiprocessing
 class LightFMModel(Model):
-    def __init__(self, n_factors, n_users, n_items, lambda_u=0.0, lambda_v=0.0, learning_rate=0.01, loss="warp",
-                 use_bias=True):
+    def __init__(self, n_factors, n_users, n_items, V_features=None, lambda_u=0.0, lambda_v=0.0, learning_rate=0.01,
+                 loss="warp",
+                 use_bias=True, normalize_features=False, exclude_items=None):
 
         super(LightFMModel, self).__init__(n_users, n_items)
-        self.model = LightFM(learning_rate=learning_rate, loss=loss, no_components=n_factors, item_alpha=lambda_u,
-                             user_alpha=lambda_v)
+        self.model = LightFM(learning_rate=learning_rate, loss=loss, no_components=n_factors, item_alpha=lambda_v,
+                             user_alpha=lambda_u)
         self.train_coo = None
         self.use_bias = use_bias
+        self.learning_rate = learning_rate
+        self.normalize_features = normalize_features
+        from scipy.sparse import coo_matrix, csr_matrix
+        if exclude_items is None:
+            exclude_items = set()
+        else:
+            exclude_items = set(exclude_items)
+
+        if V_features is not None:
+            if normalize_features:
+                V_features = V_features / ((1E-10 + V_features.sum(1).reshape((V_features.shape[0], 1))) ** 0.5)
+
+            # exclude cold items' features from the features matrix and add one column at the end to each cold items
+            # this make cold items looks "the same" to the algorithms and so prevent them from affecting the algorithm
+            self.V_features_excluded = csr_matrix(V_features)
+            if len(exclude_items) > 0:
+                self.V_features_excluded[list(exclude_items), :] = 0.0
+            m = coo_matrix(self.V_features_excluded)
+            data = list(m.data)
+            row = list(m.row)
+            col = list(m.col)
+            base = V_features.shape[1]
+            for i in range(n_items):
+                if i in exclude_items:
+                    # set the last column to annotate cold item
+                    row.append(i)
+                    col.append(n_items + base)
+                    data.append(1)
+                else:
+                    row.append(i)
+                    col.append(i + base)
+                    data.append(1)
+            self.V_features_excluded = coo_matrix((data, (row, col)), shape=(n_items, n_items + base + 1))
+
+            # include cold items' features in the features matrix so that the algorithm
+            # can score the cold start recommendations
+            self.V_features_orig = csr_matrix(V_features)
+            m = coo_matrix(self.V_features_orig)
+            data = list(m.data)
+            row = list(m.row)
+            col = list(m.col)
+            base = V_features.shape[1]
+            for i in range(n_items):
+                if i not in exclude_items:
+                    row.append(i)
+                    col.append(i + base)
+                    data.append(1)
+            self.V_features_orig = coo_matrix((data, (row, col)), shape=(n_items, n_items + base + 1))
+
+        else:
+            self.V_features_excluded = None
+            self.V_features_orig = None
+
+    def params(self):
+        return super(LightFMModel, self).params() + [
+            ["lr", self.model.learning_rate],
+            ["factors", self.model.no_components],
+            ["l_u", self.model.user_alpha],
+            ["l_v", self.model.item_alpha],
+            ["loss", self.model.loss],
+            ["norm_fea", self.normalize_features]
+
+        ]
 
     def train(self, train_dict, epoch=1, adagrad=False, hard_case=False):
         if self.train_coo is None:
+            self.check_signature(train_dict)
             self.train_coo = dict_to_coo(train_dict, self.n_users, self.n_items)
-
-        return self.model.fit_partial(self.train_coo, epochs=epoch, verbose=True,
-                                      num_threads=multiprocessing.cpu_count())
+        import multiprocessing
+        return self.model.fit_partial(self.train_coo, epochs=epoch, verbose=False,
+                                      num_threads=multiprocessing.cpu_count(), item_features=self.V_features_excluded)
 
     def validate(self, train_dict, valid_dict, per_user_sample=100):
         return self.auc(valid_dict, train_dict)
 
     def scores_for_users(self, users):
+        import multiprocessing
         for u in users:
-            yield self.model.predict(u, numpy.arange(self.n_items), num_threads=multiprocessing.cpu_count())
+            yield self.model.predict(u, numpy.arange(self.n_items),
+                                     num_threads=multiprocessing.cpu_count(),
+                                     item_features=self.V_features_orig)

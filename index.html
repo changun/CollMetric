@@ -1,0 +1,126 @@
+<!DOCTYPE html>
+<!--suppress ALL -->
+<html>
+<head lang="en">
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+
+    <link href="//cdnjs.cloudflare.com/ajax/libs/semantic-ui/1.11.8/semantic.min.css" rel="stylesheet" />
+    <script src="//cdnjs.cloudflare.com/ajax/libs/jquery/2.1.3/jquery.min.js"></script>
+    <script src="//cdnjs.cloudflare.com/ajax/libs/semantic-ui/1.11.8/semantic.min.js"></script>
+    <script src="//cdnjs.cloudflare.com/ajax/libs/handlebars.js/3.0.1/handlebars.runtime.min.js"></script>
+    <script src="//cdnjs.cloudflare.com/ajax/libs/handlebars.js/3.0.1/handlebars.min.js"></script>
+    <script src="//cdnjs.cloudflare.com/ajax/libs/underscore.js/1.8.3/underscore-min.js"></script>
+
+    <title>Multi-Model Recommendations</title>
+
+</head>
+<body>
+<div class="ui form">
+
+    <div class="inline fields">
+        <label>Dataset</label>
+        <div class="ui selection dropdown">
+            <input type="hidden" name="dataset" id="dataset_input">
+            <i class="dropdown icon"></i>
+            <div class="default text">Select Dataset</div>
+            <div class="menu">
+                <div class="item" data-value="flickr">Flickr</div>
+                <div class="item" data-value="bookcx">BookCX</div>
+                <div class="item" data-value="lastfm">LastFM</div>
+                <div class="item" data-value="medium">Medium</div>
+                <div class="item" data-value="netflix">Netflix</div>
+            </div>
+        </div>
+        <label>User Id</label>
+        <div class="field">
+            <input type="text" placeholder="Enter User Id">
+        </div>
+    </div>
+</div>
+<table class="ui celled padded table">
+    <thead></thead>
+    <tbody></tbody>
+</table>
+</body>
+
+<script>
+    $('input[type=text]').on('keydown', function(e) {
+        if (e.which == 13) {
+            var userid = $("input[type=text]").val();
+            var dataset = $("#dataset_input").val();
+            var endpoint = "/api/" + dataset + "/user_details/" + userid
+            $.getJSON(endpoint, function(dat){
+                var k = dat.n_clusters;
+                var items = dat.item_details;
+                var max_cluster_train_size = 0;
+                var max_cluster_test_size = 0;
+                for (var i = 0; i < k; i++) {
+
+                    if(dat.cluster_train[i]){
+
+                        max_cluster_train_size = _.max([max_cluster_train_size, dat.cluster_train[i].length]);
+                    }
+                    if(dat.cluster_recommendation[i]){
+
+                        max_cluster_test_size = _.max([max_cluster_test_size, dat.cluster_recommendation[i].length]);
+                    }
+
+                }
+                var head = "<tr>";
+                for(var cluster=0; cluster < k; cluster++){
+                    head += "<th>Mixture " + cluster + " (Weight: " + dat["densities"][cluster].toFixed(2) + ") </th>";
+                }
+                head += "</tr>";
+                $("thead").html(head);
+                var trainHtml = "<tr><th class='subtitle' colspan='" + k +"'>User Like</th></tr>";
+
+                for(var row = 0; row < _.min([max_cluster_train_size, 5]); row++){
+                    trainHtml += "<tr>";
+                    for(var cluster=0; cluster < k; cluster++){
+                        trainHtml += "<td>";
+
+                        if(dat.cluster_train[cluster] && row < dat.cluster_train[cluster].length){
+                            var item = items[dat.cluster_train[cluster][row][0]];
+                            if(item.img) {
+                                trainHtml += '<img class="ui medium rounded image" src="' + item.img + '">'
+                            }else{
+                                trainHtml += '<a href="' + item.url + '" target="_blank">' + item.title + '</a>'
+                            }
+                        }
+                        trainHtml += "</td>";
+                    }
+                    trainHtml += "</tr>";
+                }
+                var testHtml =  "<tr><th class='subtitle' colspan='" + k +"'>We recommend</th></tr>";
+                for(var row = 0; row < max_cluster_test_size; row++){
+                    testHtml += "<tr>";
+                    for(var cluster=0; cluster < k; cluster++){
+                        testHtml += "<td>";
+                        if(dat.cluster_recommendation[cluster] && row < dat.cluster_recommendation[cluster].length){
+                            var item = items[dat.cluster_recommendation[cluster][row][0]];
+                            var hit = dat.cluster_recommendation[cluster][row][1];
+                            if(hit) {
+                                testHtml += '<div class="ui heart rating" data-rating="1" data-max-rating="1"></div>';
+                            }
+                            if(item.img) {
+                                testHtml += '<img class="ui medium rounded image" src="' + item.img + '">'
+                            }else{
+                                testHtml += '<a href="' + item.url + '" target="_blank">' + item.title + '</a>'
+                            }
+                        }
+                        testHtml += "</td>";
+                    }
+                    testHtml += "</tr>";
+                }
+                $("tbody").html(trainHtml + testHtml);
+
+            })
+        }
+    });
+
+    $('.ui.dropdown')
+            .dropdown()
+    ;
+</script>
+</html>

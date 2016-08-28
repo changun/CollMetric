@@ -1,12 +1,13 @@
 from cpython.mem cimport PyMem_Malloc, PyMem_Realloc, PyMem_Free
-from libc.stdlib cimport rand, RAND_MAX
+from libc.stdlib cimport rand, RAND_MAX, srand
 import cython
 from libcpp.set cimport set as c_set
 from libcpp.vector cimport vector
 import numpy as np
+import time
 
 @cython.boundscheck(False)
-def sample(dict train_dict, dict exclude_dict, int n_items, int per_user_sample):
+def sample(dict train_dict, dict exclude_dict, set exclude_items_set, int n_items, int per_user_sample):
     cdef int[2]** dat
 
     cdef int n_users = len(train_dict.keys())
@@ -16,6 +17,7 @@ def sample(dict train_dict, dict exclude_dict, int n_items, int per_user_sample)
     cdef c_set[int]* excludes
     cdef index = 0
 
+    srand(np.random.randint(1000000))
 
     cdef c_set[int]** exclude_items = <c_set[int]**> PyMem_Malloc(n_users * sizeof(void*));
     cdef vector[int] n_pos_for_user = [-1] * n_users
@@ -52,7 +54,7 @@ def sample(dict train_dict, dict exclude_dict, int n_items, int per_user_sample)
                     triplets[j][1] = pos
                     triplets[j][3] = sample[1]
                     neg = rand() % n_items
-                    while exclude_items[i].count(neg) == 1:
+                    while exclude_items[i].count(neg) == 1 or neg in exclude_items_set:
                         neg = rand() % n_items
                     triplets[j][2] = neg
                     if j_in_iteration[pos] != iteration:
@@ -62,7 +64,7 @@ def sample(dict train_dict, dict exclude_dict, int n_items, int per_user_sample)
                         j_in_iteration[neg]=iteration
                         unique_j.push_back(neg)
 
-            yield triplets, unique_i, unique_j
+            yield triplets
             unique_j.clear()
             iteration += 1
     finally:
@@ -71,10 +73,6 @@ def sample(dict train_dict, dict exclude_dict, int n_items, int per_user_sample)
             PyMem_Free(dat[i])
         PyMem_Free(exclude_items)
         PyMem_Free(dat)
-
-
-
-
 
 
 
