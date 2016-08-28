@@ -1,5 +1,4 @@
 import pyximport
-
 pyximport.install()
 import numpy
 from multiprocessing import Pool
@@ -52,28 +51,6 @@ def _batch_sampler(sampler, batch_size, n_users, n_items):
         yield sub_triplet
 
 
-def _sample_uneven(train_dict, exclude_items, n_items):
-    users = []
-    pos_items = []
-    for u, items in train_dict.items():
-        for i in items:
-            users.append(u)
-            pos_items.append(i)
-    triplet = numpy.zeros((len(users), 4), "int64")
-    triplet[:, 0] = users
-    triplet[:, 1] = pos_items
-    triplet[:, 3] = numpy.arange(len(users))
-    # we will reuse this array
-    while True:
-        # additional item samples other than that already in unique_pos_j
-        available_items = numpy.asarray([i for i in range(n_items) if i not in exclude_items])
-        triplet[:, 2] = numpy.random.choice(available_items, size=len(users))
-        for i in xrange(len(users)):
-            if triplet[i, 2] in train_dict[triplet[i, 0]]:
-                triplet[i, 2] = numpy.random.randint(n_items)
-                while triplet[i, 2] in train_dict[triplet[i, 0]] or triplet[i, 2] in exclude_items:
-                    triplet[i, 2] = numpy.random.randint(n_items)
-        yield triplet
 
 
 def sigterm_handler(_signo, _stack_frame):
@@ -140,7 +117,7 @@ def _init_sampler(train_dict, exclude_dict, exclude_items, n_items, per_user_sam
         _cur_samplers[sid] = _sample_warp(train_dict, exclude_dict, n_items, batch_size, warp)
         return sid
     if uneven:
-        basic_sampler = _sample_uneven(train_dict, exclude_items, n_items)
+        basic_sampler = fast_utils.sample_uneven(train_dict, exclude_items, n_items)
     else:
         basic_sampler = fast_utils.sample(train_dict, exclude_dict, exclude_items, n_items, per_user_sample)
     if batch_size > 0:
