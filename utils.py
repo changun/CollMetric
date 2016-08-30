@@ -3,7 +3,7 @@ import time
 import sys
 import json
 import numpy as np
-import pickle
+import cPickle as pickle
 import gzip
 import urllib2
 from collections import defaultdict
@@ -123,7 +123,6 @@ def early_stop(model, train_dict_bc, metric_fn, n_epochs=2000, validation_freque
         print model
         while True:
             model.train(train_dict_bc, epoch=validation_frequency,  **kwargs)
-
             new_metric = metric_fn(model)
             if new_metric > best_metric:
                 # worse than the best metric
@@ -133,7 +132,6 @@ def early_stop(model, train_dict_bc, metric_fn, n_epochs=2000, validation_freque
                      model.learning_rate = 0.01
                      print "New learning rate %g" % (model.learning_rate,)
                      model.f = None
-
             else:
 
 
@@ -226,7 +224,7 @@ def preprocess(user_dict, portion, popular_item_percentile=90, seed=1):
     return n_items, n_users, train_dict, valid_dict, test_dict, exclude_dict, cold_item_dict, popular_items, cold_items
 
 
-def v_features(photo_ids, path="/data/dataset/features_all.npy"):
+def v_features(photo_ids, path="/home/ubuntu/notebooks/dataset/features_all.npy"):
     id_raw_id = {}
     names = json.loads(urllib2.urlopen('https://s3-us-west-1.amazonaws.com/cornell-nyc-sdl-tmp/images.json').read())
     index = 0
@@ -330,7 +328,7 @@ def sample_holdout_user(user_dict, user_ids):
 
 
 def flickr(max_likes=100, features=False):
-    user_dict, photo_ids, user_ids = pickle.load(open("/data/dataset/dat_100_100000.p", "rb"))
+    user_dict, photo_ids, user_ids = pickle.load(gzip.open("/data/dataset/dat_100_100000.p.gz", "rb"))
     numpy.random.seed(1)
     user_dict_reduced = dict(
         [(i_index, set(numpy.random.choice(list(items), size=min(len(items), max_likes), replace=False))) for
@@ -1313,7 +1311,7 @@ def medium_details(titles):
 #                                variance_mu=1.0, uneven_sample=True,
 #                                update_mu=True,
 #                                lambda_variance=variance,
-#                                warp=20, max_norm=1.1, K=1, lambda_bias=bias, lambda_cov=cov, margin=.5, lambda_density=0.0001,
+#                                warp_count=20, max_norm=1.1, K=1, lambda_bias=bias, lambda_cov=cov, margin=.5, lambda_density=0.0001,
 #                                bias_range=(1E-6, 10))
 #         out.append(early_stop(model, train_dict_n, lambda m: -m.recall(valid_dict_n, train_dict_n, n_users=3000)[0][0],
 #                    patience=1000, validation_frequency=250, n_epochs=10000000, adagrad=True))
@@ -1334,7 +1332,7 @@ def medium_details(titles):
 #                               variance_mu=1.0, uneven_sample=True,
 #                               update_mu=True,
 #                               lambda_variance=var,
-#                               warp=20, max_norm=1.1, K=1, lambda_bias=bias, lambda_cov=1, margin=.5, lambda_density=0.0001,
+#                               warp_count=20, max_norm=1.1, K=1, lambda_bias=bias, lambda_cov=1, margin=.5, lambda_density=0.0001,
 #                               bias_range=(1E-6, 10))
 #         out.append(early_stop(lastfm_50, train_dict_l, lambda m: -m.recall(valid_dict_l, train_dict_l, n_users=3000)[0][0],
 #                    patience=2000, validation_frequency=150, n_epochs=10000000, adagrad=True))

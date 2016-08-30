@@ -1,79 +1,66 @@
 from cpython.mem cimport PyMem_Malloc, PyMem_Realloc, PyMem_Free
-from libc.stdlib cimport rand, RAND_MAX, srand
-import cython
+import cython, random
+import numpy as numpy
+#cimport numpy as numpy
+from cython.parallel import parallel, prange
+from libc.stdlib cimport rand, srand
 from libcpp.set cimport set as c_set
-from libcpp.vector cimport vector
-import numpy as np
-import time
 
 @cython.boundscheck(False)
-def sample(dict train_dict, dict exclude_dict, set exclude_items_set, int n_items, int per_user_sample):
-    cdef int[2]** dat
+def sample_warp(train_dict, Py_ssize_t n_items, Py_ssize_t warp_count, Py_ssize_t batch_size):
+    cdef Py_ssize_t index, i, j , row, u, pointer_to_triplet, j_neg, start_row_in_triplet, offset, j_pos, pointer_to_pair
 
-    cdef int n_users = len(train_dict.keys())
-    cdef int pos
-    cdef int i
-    cdef Py_ssize_t j, base, neg
-    cdef c_set[int]* excludes
-    cdef index = 0
-
-    srand(np.random.randint(1000000))
-
-    cdef c_set[int]** exclude_items = <c_set[int]**> PyMem_Malloc(n_users * sizeof(void*));
-    cdef vector[int] n_pos_for_user = [-1] * n_users
-    triplets = np.zeros(((n_users * per_user_sample), 4), dtype="int64")
-    dat = <int[2]**> PyMem_Malloc(n_users * sizeof(int[2]*))
-    cdef int sample_id = 0
-    cdef vector[int] unique_j
-    unique_i = np.asarray(list(train_dict.keys()))
-    for i, (user, items) in enumerate(train_dict.items()):
-        n_pos_for_user[i] = len(items)
-        dat[i] = <int[2]*> PyMem_Malloc(len(items) * sizeof(int[2]))
-        for j, item in enumerate(items):
-            dat[i][j][0] = item
-            dat[i][j][1] = sample_id
-            sample_id += 1
-        for j in xrange(per_user_sample):
-            triplets[i*per_user_sample + j][0] = user
-        exclude_items[i] = new c_set[int]()
+    # create pairs that contain all the positive (user,item) pairs
+    pos_sample_count = sum([len(items) for items in train_dict.values()])
+    n_users = numpy.max(train_dict.keys())+1
+    # a <n_pos_sample, 2> matrix
+    cdef long [:, :] pairs_view = numpy.zeros((pos_sample_count, 2), dtype="int64")
+    # an array of set
+    cdef c_set[long]** pos_items = <c_set[long]**> PyMem_Malloc(n_users * sizeof(void*));
+    index = 0
+    for u, items in train_dict.items():
+        pos_items[u] = new c_set[long]()
         for item in items:
-            exclude_items[i].insert(item)
-        if exclude_dict is not None and user in exclude_dict:
-            for item in exclude_dict[user]:
-                exclude_items[i].insert(item)
-    cdef j_in_iteration = [-1] * n_items
+            pos_items[u].insert(item)
+            pairs_view[index, 0] = u
+            pairs_view[index, 1] = item
+            index += 1
+    orders = numpy.arange(len(pairs_view))
+    # shuffle the orders array
+    numpy.random.seed()
+    numpy.random.shuffle(orders)
+    cdef long[:] orders_view = orders
+    # reseed c random generator
+    srand(numpy.random.randint(1000000))
+    # the sampled triplets we will return at the end
+    cdef long [:, :] sampled_triplets_view = numpy.zeros((batch_size * warp_count, 3), dtype="int64")
+
+    index = 0
     try:
-        iteration = 0
         while True:
-
-            for i in xrange(n_users):
-                base = i * per_user_sample
-                for j in range(base, base + per_user_sample):
-                    sample = dat[i][rand() % n_pos_for_user[i]]
-                    pos = sample[0]
-                    triplets[j][1] = pos
-                    triplets[j][3] = sample[1]
-                    neg = rand() % n_items
-                    while exclude_items[i].count(neg) == 1 or neg in exclude_items_set:
-                        neg = rand() % n_items
-                    triplets[j][2] = neg
-                    if j_in_iteration[pos] != iteration:
-                        j_in_iteration[pos]=iteration
-                        unique_j.push_back(pos)
-                    if j_in_iteration[neg] != iteration:
-                        j_in_iteration[neg]=iteration
-                        unique_j.push_back(neg)
-
-            yield triplets
-            unique_j.clear()
-            iteration += 1
+            # when we do not have enough remaining pairs to sample, re-shuffle the pairs again and reset index,
+            if index + batch_size > pairs_view.shape[0]:
+                numpy.random.seed()
+                numpy.random.shuffle(orders)
+                orders_view = orders
+                index = 0
+            with nogil:
+                for offset in range(batch_size):
+                    row = index + offset
+                    pointer_to_pair = orders_view[row]
+                    u = pairs_view[pointer_to_pair, 0]
+                    j_pos = pairs_view[pointer_to_pair, 1]
+                    start_row_in_triplet = offset * warp_count
+                    for pointer_to_triplet in range(start_row_in_triplet, start_row_in_triplet + warp_count):
+                        j_neg = rand() % n_items
+                        while pos_items[u].count(j_neg) :
+                            j_neg = rand() % n_items
+                        sampled_triplets_view[pointer_to_triplet,0] = u
+                        sampled_triplets_view[pointer_to_triplet,1] = j_pos
+                        sampled_triplets_view[pointer_to_triplet,2] = j_neg
+            index += batch_size
+            yield numpy.asarray(sampled_triplets_view)
     finally:
-        for i in range(n_users):
-            PyMem_Free(exclude_items[i])
-            PyMem_Free(dat[i])
-        PyMem_Free(exclude_items)
-        PyMem_Free(dat)
-
-
-
-
+        for u, items in train_dict.items():
+            PyMem_Free(pos_items[u])
+        PyMem_Free(pos_items)
