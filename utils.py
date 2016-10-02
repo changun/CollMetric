@@ -1577,8 +1577,6 @@ def eval_one(id):
     import theano.misc.pkl_utils
     from pymongo import MongoClient
     import gridfs
-    import io
-    import cPickle
     db = MongoClient().models
     fs = gridfs.GridFS(db)
     dataset_db = MongoClient().datasets
