@@ -31,6 +31,9 @@ def _init():
 
 def _init_sampler(train_dict, n_items, warp_count, batch_size):
     global _cur_sampler, _cur_sampler_signature
+    # garbage collection to avoid OFM
+    gc.collect()
+    gc.collect()
     # compute signature of the given arguments
     signature = (sum(map(lambda u: sum(u[1]) % (u[0] + 1), train_dict.items())),
                  n_items,
@@ -55,7 +58,7 @@ def _sample():
 #     print ("Clear sampler")
 
 
-_pool = Pool(processes=8, initializer=_init)
+_pool = Pool(processes=1, initializer=_init)
 sampler_cache = {}
 
 

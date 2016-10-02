@@ -252,7 +252,8 @@ class BPRModel(Model):
                  warp_count=1,
                  batch_size=100000,
                  bias_init=0.0,
-                 bias_range=(-numpy.Infinity, numpy.Infinity)):
+                 bias_range=(-numpy.Infinity, numpy.Infinity),
+                 negative_sample_choice="max"):
 
         Model.__init__(self, n_users, n_items)
         self.n_factors = n_factors
@@ -369,6 +370,7 @@ class BPRModel(Model):
         self.n_user_count = 4
         self.value_f = None
         self.warp_f = None
+        self.negative_sample_choice = negative_sample_choice
 
     def params(self):
         return super(BPRModel, self).params() + [
@@ -510,9 +512,19 @@ class BPRModel(Model):
         # count weights for each positive pair (based on WASABIE)
         weights = T.switch(violations > 0, T.cast(T.log(self.n_items * violations / self.warp_count), "float32"),
                            T.zeros((violations.shape[0],), dtype="float32"))
-        # active triplet are those have maximun loss among the same positive pairs
-        active_sample_index = T.argmax(losses, axis=1) + positive_pair_index
-        active_samples = self.triplet[active_sample_index]
+        if "negative_sample_choice" not in self.__dict__ or self.negative_sample_choice == "max":
+            # active triplet are those have maximun loss among the same positive pairs
+            active_sample_index = T.argmax(losses, axis=1) + positive_pair_index
+            active_samples = self.triplet[active_sample_index]
+        else:
+            weights = T.repeat(
+                T.switch(violations > 0, T.cast(weights / violations, "float32"),
+                           T.zeros((violations.shape[0],), dtype="float32")),
+                self.warp_count
+            )
+
+            active_samples = self.triplet
+
         return theano.function([self.triplet], [active_samples, weights])
 
     def gen_updates(self, cost, per_sample_losses):
@@ -528,7 +540,8 @@ class BPRModel(Model):
             )
             gradient = T.grad(cost=cost, wrt=param, disconnected_inputs='ignore') / (
             T.cast(dividend, "float32") + 1E-10)
-            gradient += T.grad(cost=regularization_cost, wrt=param, disconnected_inputs='ignore')
+            if regularization_cost != 0:
+                gradient += T.grad(cost=regularization_cost, wrt=param, disconnected_inputs='ignore')
             new_history = ifelse(self.adagrad > 0, (history) + (gradient ** float(2)), history)
             update_list += [[history, new_history]]
             adjusted_grad = ifelse(self.adagrad > 0, gradient / ((new_history ** float(0.5)) + float(1e-10)), gradient)
@@ -630,7 +643,8 @@ class KBPRModel(BPRModel):
                  normalization=False,
                  bias_range=(1E-6, 10),
                  batch_size=200000,
-                 max_norm=1):
+                 max_norm=1,
+                 negative_sample_choice="max"):
         if U is None:
             U = numpy.random.normal(0, 1 / (n_factors ** 0.5), (n_users * K, n_factors)).astype(
                 theano.config.floatX) / 5
@@ -644,7 +658,8 @@ class KBPRModel(BPRModel):
                           batch_size=batch_size,
                           warp_count=warp_count,
                           bias_init=bias_init,
-                          bias_range=bias_range, )
+                          bias_range=bias_range,
+                          negative_sample_choice=negative_sample_choice)
         self.K = K
         self.lambda_mean_distance = lambda_mean_distance
         self.lambda_variance = lambda_variance
@@ -923,9 +938,7 @@ class KBPRModel(BPRModel):
                 break
         return numpy.transpose(numpy.concatenate(all_clusters), axes=[1, 0, 2]).reshape(
             (K * self.n_users, self.n_factors))
-    def morp(self, new_K):
-        import inspect
-        inspect.getargspec(self.__init__)
+
 
     def initialize(self, train_dict, epoch=1, adagrad=True, profile=False, exclude_items=None):
         if self.init_f is None:
@@ -1221,8 +1234,9 @@ class VisualFactorKBPR(VisualKBPRAbstract):
 
     def l2_reg(self):
         reg = super(VisualFactorKBPR, self).l2_reg()
-        has_features = (self.V_features ** 2).sum(1).nonzero()
-        reg += [[(self.V - self.V_embedding(numpy.arange(self.n_items)))[has_features], self.lambda_v_off]]
+        #has_features = (self.V_features ** 2).sum(1).nonzero()
+        #reg += [[(self.V - self.V_embedding(numpy.arange(self.n_items)))[has_features], self.lambda_v_off]]
+        reg += [[(self.V - self.V_embedding(numpy.arange(self.n_items))), self.lambda_v_off]]
         # reg += [[(self.U[self.i] - self.V_embedding[self.j_pos]), 0.0001, 1]]
         if self.U_embedding is not None:
             if self.K == 1:

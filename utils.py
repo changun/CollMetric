@@ -117,44 +117,37 @@ def early_stop(model, train_dict_bc, metric_fn, n_epochs=2000, validation_freque
     import theano.misc.pkl_utils
     output = None
     best_metric = numpy.Infinity
-
-    try:
-        patience_count = patience
-        print model
-        while True:
-            model.train(train_dict_bc, epoch=validation_frequency,  **kwargs)
-            new_metric = metric_fn(model)
-            if new_metric > best_metric:
-                # worse than the best metric
-                patience_count -= validation_frequency
-                print ("Patience %d" % (patience_count,))
-                if "f" in model.__dict__ and model.learning_rate > 0.01:
-                     model.learning_rate = 0.01
-                     print "New learning rate %g" % (model.learning_rate,)
-                     model.f = None
-            else:
+    patience_count = patience
+    print model
+    while True:
+        model.train(train_dict_bc, epoch=validation_frequency,  **kwargs)
+        new_metric = metric_fn(model)
+        if new_metric > best_metric:
+            # worse than the best metric
+            patience_count -= validation_frequency
+            print ("Patience %d" % (patience_count,))
+            # if "f" in model.__dict__ and model.learning_rate > 0.01:
+            #      model.learning_rate = 0.01
+            #      print "New learning rate %g" % (model.learning_rate,)
+            #      model.f = None
+        else:
 
 
-                # the best metric
-                # recover patience
-                patience_count = patience
-                # record best metric
-                best_metric = new_metric
-                # take a snapshot
-                output = cStringIO.StringIO()
-                theano.misc.pkl_utils.dump(model, output)
-                output.flush()
-            n_epochs -= validation_frequency
-            if patience_count <= 0 or n_epochs <= 0:
-                raise Exception()
-    except Exception as e:
-        print e
-    finally:
-        if output is not None:
-            best_model = theano.misc.pkl_utils.load(output)
-            return best_metric, best_model
-        return None
-
+            # the best metric
+            # recover patience
+            patience_count = patience
+            # record best metric
+            best_metric = new_metric
+            # take a snapshot
+            output = cStringIO.StringIO()
+            theano.misc.pkl_utils.dump(model, output)
+            output.flush()
+        n_epochs -= validation_frequency
+        if patience_count <= 0 or n_epochs <= 0:
+            if output is not None:
+                best_model = theano.misc.pkl_utils.load(output)
+                return best_model
+            return None
 
 def data_to_dict(data):
     data_dict = defaultdict(set)
@@ -211,6 +204,21 @@ def split(user_dict, portion, popular_item_percentile, seed=1):
 
            ))
     return train_dict, valid_dict, test_dict, exclude_dict, cold_item_test_dict, popular_items, cold_items
+
+def split_P(user_dict, P, thres, seed=1):
+    numpy.random.seed(seed)
+    train_dict = {}
+    test_dict = {}
+    valid_dict = {}
+    exclude_dict = {}
+
+    for user, items in user_dict.iteritems():
+        # for in_matrix items
+        if len(items) > max(P, thres-1):
+            train_dict[user] = set(numpy.random.choice(list(items), P, False))
+            valid_dict[user] = items - train_dict[user]
+
+    return train_dict, valid_dict
 
 
 def preprocess(user_dict, portion, popular_item_percentile=90, seed=1):
@@ -367,6 +375,54 @@ def movielens1M(min_rating=0.0):
                 user_dict[user].add(item)
     return user_dict
 
+def citeulike(tag_thres=10):
+
+    user = 0
+    max_item_id = -1
+    user_dict = {}
+    for l in open("citeulike-t/users.dat").readlines():
+        items = l.strip().split(" ")
+        if user not in user_dict:
+            user_dict[user] = set()
+        for item in items:
+            user_dict[user].add(int(item))
+            max_item_id = max(max_item_id, int(item))
+        user += 1
+    tag_id = 0
+    feature_dict = {}
+    for l in open("citeulike-t/tag-item.dat").readlines():
+        items = l.strip().split(" ")
+        for item in items:
+            item = int(item)
+            if item not in feature_dict:
+                feature_dict[item] = set()
+            feature_dict[item].add(tag_id)
+        tag_id += 1
+    features, labels = feature_sets_to_array(feature_dict, tag_thres, max_item_id+1)
+
+    return user_dict, features, labels, None
+
+def echonest(count_thres=5):
+    user_ids = {}
+    item_ids = {}
+    user_dict = {}
+
+    with open("train_triplets.txt") as f:
+        for l in f.readlines():
+            fields = l.split("\t")
+            if len(fields) == 3:
+                username = fields[0].strip()
+                itemname = fields[1].strip()
+                count = int(fields[2].strip())
+                if count >= count_thres:
+                    if username not in user_ids:
+                        user_ids[username] = len(user_ids)
+                        user_dict[user_ids[username]] = set()
+                    if itemname not in item_ids:
+                        item_ids[itemname] = len(item_ids)
+                    item_id = item_ids[itemname]
+                    user_dict[user_ids[username]].add(item_id)
+    return user_dict
 
 def lastfm(tag_freq_thres=20, user_thres=50, first_tag_only=False, include_play_count=False):
     import pymongo
@@ -1454,3 +1510,118 @@ def lsh_recall(U, V, test, valid, exclude, n=10,
         recalls.append(recall)
     print "Time:" + str(total_time / len(test.keys()))
     print numpy.mean(recalls)
+
+def save(dataset, model, n_users, n_items, train_dict, valid_dict, test_dict, exclude_dict, cold_dict, popular, cold, **kargs):
+    import theano.misc.pkl_utils
+    from pymongo import MongoClient
+    import gridfs
+    import io
+    import cPickle
+    db = MongoClient().models
+    fs = gridfs.GridFS(db)
+
+    dataset_db = MongoClient().datasets
+    dataset_fs = gridfs.GridFS(dataset_db)
+    kargs["dataset"] = dataset
+    datasets = dataset_db["fs.files"].find(kargs)
+    if datasets.count() == 0:
+        print "Save dataset " + dataset + str(kargs)
+        with io.BytesIO() as bytesBuffer:
+            theano.misc.pkl_utils.dump(
+                {"train_dict": dict_to_coo(train_dict, n_users, n_items),
+                 "valid_dict": dict_to_coo(valid_dict, n_users, n_items),
+                 "test_dict": dict_to_coo(test_dict, n_users, n_items),
+                 "exclude_dict": dict_to_coo(exclude_dict, n_users, n_items),
+                 "cold_dict": dict_to_coo(cold_dict, n_users, n_items),
+                 "popular": popular,
+                 "cold": cold}, bytesBuffer)
+            dataset_id = hash(bytesBuffer.getvalue())
+            dataset_fs.put(bytesBuffer.getvalue(), _id=dataset_id, **kargs)
+    else:
+        dataset_id = datasets[0]["_id"]
+
+
+    attr = kargs
+    for key in model.__dict__:
+        if type(model.__dict__[key]) in {float, int, str, bool}:
+            attr[key] = model.__dict__[key]
+    object_id = io.BytesIO()
+    cPickle.dump(model, object_id)
+    attr["_id"] = hash(object_id.getvalue())
+    attr["dataset"] = dataset
+    attr["name"] = str(model)
+    attr["n_users"] = n_users
+    attr["n_items"] = n_items
+    attr["dataset_id"] = dataset_id
+    attr["class"] = type(model).__name__
+
+    if not fs.exists(attr["_id"]):
+        print str("Save " + str(model))
+        with fs.new_file(**attr) as out:
+            with io.BytesIO() as bytesBuffer:
+                theano.misc.pkl_utils.dump(model, bytesBuffer)
+                out.write(bytesBuffer.getvalue())
+
+def save_batch(filenames, dataset, n_users, n_items, train_dict, valid_dict, test_dict, exclude_dict, cold_dict, popular, cold, **kargs):
+    import theano.misc.pkl_utils, os
+    for f in filenames:
+        try:
+            ms = theano.misc.pkl_utils.load(f)
+        except Exception:
+            continue
+        for m in ms:
+            model = m["model"]
+            save(dataset, model, n_users, n_items, train_dict, valid_dict, test_dict, exclude_dict, cold_dict, popular, cold, **kargs)
+
+def eval_one(id):
+    import theano.misc.pkl_utils
+    from pymongo import MongoClient
+    import gridfs
+    import io
+    import cPickle
+    db = MongoClient().models
+    fs = gridfs.GridFS(db)
+    dataset_db = MongoClient().datasets
+    dataset_fs = gridfs.GridFS(dataset_db)
+    model_record = db["fs.files"].find_one(id)
+    dataset_id = model_record["dataset_id"]
+    dataset = theano.misc.pkl_utils.load(dataset_fs.get(dataset_id))
+    model = theano.misc.pkl_utils.load(fs.get(id))
+    train, valid, test, exclude = coo_to_dict(dataset["train_dict"]), \
+                                  coo_to_dict(dataset["valid_dict"]), \
+                                  coo_to_dict(dataset["test_dict"]), \
+                                  coo_to_dict(dataset["exclude_dict"])
+    [[valid_recall_100, valid_recall_100_sem],
+     [valid_recall_50, valid_recall_50_sem],
+     [valid_recall_10, valid_recall_10_sem]
+     ] = model.recall(valid, train)
+    model_record["valid_recall_100"] = valid_recall_100
+    model_record["valid_recall_50"] = valid_recall_50
+    model_record["valid_recall_10"] = valid_recall_10
+    model_record["valid_recall_100_sem"] = valid_recall_100_sem
+    model_record["valid_recall_50_sem"] = valid_recall_50_sem
+    model_record["valid_recall_10_sem"] = valid_recall_10_sem
+    
+    [[test_recall_100, test_recall_100_sem],
+     [test_recall_50, test_recall_50_sem],
+     [test_recall_10, test_recall_10_sem]
+     ] = model.recall(test, merge_dict(merge_dict(train, valid), exclude))
+    model_record["test_recall_100"] = test_recall_100
+    model_record["test_recall_50"] = test_recall_50
+    model_record["test_recall_10"] = test_recall_10
+    model_record["test_recall_100_sem"] = test_recall_100_sem
+    model_record["test_recall_50_sem"] = test_recall_50_sem
+    model_record["test_recall_10_sem"] = test_recall_10_sem
+
+    db["fs.files"].save(model_record)
+    print "Save " + model_record["name"]
+
+def eval_batch():
+    from pymongo import MongoClient
+    db = MongoClient().models
+    for model_record in db["fs.files"].find({"valid_recall_100": {'$exists': False}, "class": {'$ne': "LightFMModel"}}):
+        eval_one(model_record["_id"])
+
+
+
+
