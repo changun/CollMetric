@@ -21,18 +21,19 @@ db = MongoClient().models
 #     print record["with_features"]
 #     db["fs.files"].save(record)
 #     print "Save" + str(model)
-while True:
-    try:
-        records = db["fs.files"].find({"valid_recall_100": {"$exists": False}})
-        if records.count() > 0:
-            record = records[random.randint(0, records.count()-1)]
-            eval_one(record["_id"])
-        else:
-            break
-    except Exception as e:
-        print e
+# while True:
+#     try:
+#         records = db["fs.files"].find({"valid_recall_100": {"$exists": False}})
+#         if records.count() > 0:
+#             record = records[random.randint(0, records.count()-1)]
+#             eval_one(record["_id"])
+#         else:
+#             break
+#     except Exception as e:
+#         print e
 
 while True:
+
     try:
         records = db["fs.files"].find({"test_recall_100_90p_30000s": {"$exists": False}})
         if records.count() > 0:
