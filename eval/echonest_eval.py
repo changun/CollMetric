@@ -10,7 +10,7 @@ n_items_l, n_users_l, train_dict_l, valid_dict_l, test_dict_l, exclude_dict_l, c
 
 def train_and_save(model):
     model = early_stop(model, train_dict_l, lambda m: -m.recall(valid_dict_l, train_dict_l, n_users=3000)[0][0],
-                      patience=2500, validation_frequency=100, n_epochs=10000000, adagrad=True)
+                      patience=500, validation_frequency=100, n_epochs=10000000, adagrad=True)
     save("EchoNest", model, n_users_l, n_items_l, train_dict_l, valid_dict_l, test_dict_l, exclude_dict_l, cold_dict_l,
          popular_l,  cold_l, count_thres=5)
 
@@ -20,11 +20,19 @@ def train_and_save(model):
 
 import gc
 ## LightFM
-# for n_factors in ( 100,):
-#     model = LightFMModel(n_factors, n_users_l, n_items_l, lambda_u=0, lambda_v=1E-5, loss="warp")
-#     train_and_save(model)
-#     del model
-#     gc.collect()
+for n_factors in ( 100, 70, 40, 10):
+    model = LightFMModel(n_factors, n_users_l, n_items_l, lambda_u=1E-4, lambda_v=1E-4, loss="warp")
+    train_and_save(model)
+    del model
+    gc.collect()
+    model = LightFMModel(n_factors, n_users_l, n_items_l, lambda_u=0, lambda_v=1E-4, loss="warp")
+    train_and_save(model)
+    del model
+    gc.collect()
+    model = LightFMModel(n_factors, n_users_l, n_items_l, lambda_u=0, lambda_v=0, loss="warp")
+    train_and_save(model)
+    del model
+    gc.collect()
 
 for n_factors in (100,):
     model = KBPRModel(n_factors, n_users_l, n_items_l,

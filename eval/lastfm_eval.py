@@ -8,28 +8,37 @@ n_items_l, n_users_l, train_dict_l, valid_dict_l, test_dict_l, exclude_dict_l, c
     user_dict_l, [3, 1, 1])
 
 
-def train_fn(model):
-    return early_stop(model, train_dict_l, lambda m: -m.recall(valid_dict_l, train_dict_l, n_users=3000)[0][0],
-                      patience=500, validation_frequency=100, n_epochs=10000000, adagrad=True)[1]
+def train_and_save(model):
+    model = early_stop(model, train_dict_l, lambda m: -m.recall(valid_dict_l, train_dict_l, n_users=3000)[0][0],
+                      patience=500, validation_frequency=100, n_epochs=10000000, adagrad=True)
+    save("LastFM", model, n_users_l, n_items_l, train_dict_l, valid_dict_l, test_dict_l, exclude_dict_l, cold_dict_l,
+         popular_l,  cold_l, user_thres=10)
 
+name = "LastFM_VKBPR_N_Factors_10.p"
+import scipy.sparse
+import gc
+for n_factors in (100, 10, 40, 70):
+    model = VisualFactorKBPR(n_factors, n_users_l, n_items_l, scipy.sparse.csc_matrix(features_l, dtype="float32"),
+                             lambda_weight_l1=0, lambda_weight_l2=0.0, dropout_rate=1, n_layers=2, width=256,
+                             lambda_v_off=1, lambda_variance=10, lambda_bias=1, margin=0.5,
+                             embedding_rescale=1, batch_size=100000)
 
-def save(method, model, name):
-    import os, shutil
-    results = []
-    try:
-        results = theano.misc.pkl_utils.load(open(name, "rb"))
-    except Exception:
-        pass
+    train_and_save(model)
+    gc.collect()
+    model = VisualFactorKBPR(n_factors, n_users_l, n_items_l, scipy.sparse.csc_matrix(features_l, dtype="float32"),
+                             lambda_weight_l1=0, lambda_weight_l2=0.0, dropout_rate=1, n_layers=2, width=256,
+                             lambda_v_off=1, lambda_variance=100, lambda_bias=1, margin=0.5,
+                             embedding_rescale=1, batch_size=100000)
 
-    results.append({"method": method, "model": model})
-    tmp = os.tempnam()
-    theano.misc.pkl_utils.dump(results, open(tmp, "wb"))
-    shutil.move(tmp, name)
+    train_and_save(model)
+    gc.collect()
+    model = VisualFactorKBPR(n_factors, n_users_l, n_items_l, scipy.sparse.csc_matrix(features_l, dtype="float32"),
+                             lambda_weight_l1=0, lambda_weight_l2=0.0, dropout_rate=1, n_layers=2, width=256,
+                             lambda_v_off=1, lambda_variance=10, lambda_bias=0.1, margin=0.5,
+                             embedding_rescale=1, batch_size=100000)
 
-files = ["LastFM_LightFM_N_Factors_10.p",  "LastFM_LightFM_Feature_N_Factors_10.p",]
-
-save_batch(files, "LastFM", n_users_l, n_items_l, train_dict_l, valid_dict_l, test_dict_l, exclude_dict_l, cold_dict_l, popular_l, cold_l,user_thres=10)
-
+    train_and_save(model)
+    gc.collect()
 
 ### LightFM
 # name = "LastFM_LightFM_N_Factors_10.p"
@@ -68,15 +77,6 @@ save_batch(files, "LastFM", n_users_l, n_items_l, train_dict_l, valid_dict_l, te
 #     model = train_fn(model)
 #     save("kbpr", model, name)
 #
-name = "LastFM_VKBPR_N_Factors_10.p"
-for n_factors in (10, 40, 70, 100):
-    model = VisualFactorKBPR(n_factors, n_users_l, n_items_l, features_l.toarray(),
-                             lambda_weight_l1=0, lambda_weight_l2=0.0, dropout_rate=.5, n_layers=2, width=256,
-                             lambda_v_off=1, lambda_variance=1, lambda_bias=1, margin=1.0,
-                             embedding_rescale=0.1)
-
-    model = train_fn(model)
-    save("vkbpr", model, name)
 
 import scipy.sparse
 features_l = features_l.toarray()

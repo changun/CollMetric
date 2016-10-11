@@ -8,6 +8,10 @@ import theano
 import time, sys
 import theano.tensor as T
 from theano.ifelse import ifelse
+import itertools
+from sklearn.metrics.pairwise import cosine_similarity
+from sklearn.metrics.pairwise import pairwise_distances
+
 
 class MLP(object):
     def __init__(self, feature_dim, n_embedding_dim, usage_count,
@@ -55,9 +59,10 @@ class MLP(object):
         from theano.tensor.shared_randomstreams import RandomStreams
         import theano.sparse
         srng = RandomStreams(seed=12345)
+
         def projection_f(j):
             activation_fn = eval(self.activation)
-            ret = features #features[j]
+            ret = features  # features[j]
             for i in range(self.n_layers - 1):
                 hidden1 = self.weights[i]
                 if training:
@@ -75,8 +80,9 @@ class MLP(object):
             embedding *= scale
             row_norms = T.sqrt(T.sum(T.sqr(embedding), axis=1))
             desired_norms = T.clip(row_norms, 0, max_norm)
-            embedding *= (desired_norms / (row_norms )).reshape((embedding.shape[0], 1))
+            embedding *= (desired_norms / (row_norms)).reshape((embedding.shape[0], 1))
             return embedding
+
         return projection_f
 
     def l2_reg(self):
@@ -135,7 +141,11 @@ class Model(object):
     def scores_for_users(self, users):
         return numpy.zeros((len(users), self.n_items))
 
+    def before_eval(self):
+        return
+
     def auc(self, likes_dict, exclude_dict):
+        self.before_eval()
         sequence = numpy.arange(self.n_items)
 
         def to_ranks(order):
@@ -172,16 +182,33 @@ class Model(object):
 
     def topN(self, users, exclude_dict, n=100, exclude_items=None):
         # return top N item (sorted)
+
+        def arglargest_n(a, n):
+            rev_a = -a
+            ret = numpy.argpartition(rev_a, n)[:n]
+            b = numpy.take(rev_a, ret)
+            return numpy.take(ret, numpy.argsort(b))
+
+        if exclude_items is not None:
+            more_n = n + len(exclude_items)
+        else:
+            more_n = n
         for inx, scores in enumerate(self.scores_for_users(users)):
             user = users[inx]
-            if exclude_dict is not None and user in exclude_dict:
-                scores[list(exclude_dict[user])] = -numpy.Infinity
-            if exclude_items is not None and len(exclude_items) > 0:
-                scores[exclude_items] = -numpy.Infinity
-            top = numpy.argpartition(-scores, n)[0:n]
-            yield sorted(top, key=lambda i: -scores[i])
+            if user in exclude_dict:
+                exclude = exclude_dict[user]
+                local_n = more_n + len(exclude_dict[user])
+                tops = arglargest_n(scores, local_n)[0:local_n]
+            else:
+                exclude = None
+                tops = arglargest_n(scores, more_n)[0:more_n]
+            tops = itertools.ifilter(lambda item: (exclude is None or item not in exclude)
+                                                  and (exclude_items is None or item not in exclude_items),
+                                     tops)
+            yield itertools.islice(tops, n)
 
     def recall(self, likes_dict, exclude_dict, ns=(100, 50, 10), n_users=None, exclude_items=None, users=None):
+        self.before_eval()
         from collections import defaultdict
         recall = defaultdict(list)
 
@@ -191,18 +218,27 @@ class Model(object):
             else:
                 numpy.random.seed(1)
                 users = numpy.random.choice(likes_dict.keys(), replace=False, size=n_users)
+        if exclude_items is not None:
+            exclude_items = set(exclude_items)
+            selected_users = []
+            for user in users:
+                if len(likes_dict[user] - exclude_items) != 0:
+                    selected_users.append(user)
+            users = selected_users
         bar = pyprind.ProgBar(len(users))
         for inx, top in enumerate(self.topN(users, exclude_dict, n=max(ns), exclude_items=exclude_items)):
             user = users[inx]
             likes = likes_dict[user]
+            top = list(top)
             for n in ns:
-                topn = top[0:n]
-                hits = [j for j in topn if j in likes]
-                recall[n].append(len(hits) / float(len(likes)))
+                hits = itertools.ifilter(lambda item: item in likes, itertools.islice(top, n))
+                hits = reduce(lambda c, _: c + 1, hits, 0)
+                recall[n].append(hits / float(len(likes)))
             bar.update(item_id=str(numpy.mean(recall[max(ns)])))
         return [[numpy.mean(recall[n]), scipy.stats.sem(recall[n])] for n in ns]
 
     def precision(self, likes_dict, exclude_dict, n=100, n_users=None, exclude_items=None):
+        self.before_eval()
         precision = []
         try:
             if n_users is None:
@@ -222,6 +258,11 @@ class Model(object):
         finally:
             return numpy.mean(precision), scipy.stats.sem(precision), precision
 
+    def __getstate__(self):
+        import copy
+        ret = copy.copy(self.__dict__)
+        return ret
+
     def __repr__(self):
         repr_str = self.__class__.__name__
         for name, val in self.params():
@@ -236,6 +277,81 @@ class Model(object):
                 val_str = str(val)
             repr_str += " " + name + " " + val_str
         return repr_str
+
+
+class Popularity(Model):
+    def __init__(self, n_users, n_items):
+        Model.__init__(self, n_users, n_items)
+        self.scores = None
+
+    def train(self, train_dict):
+        from collections import defaultdict
+        counts = defaultdict(int)
+        for items in train_dict.values():
+            for item in items:
+                counts[item] += 1
+        self.scores = numpy.asarray([counts[i] for i in xrange(self.n_items)], dtype="float32")
+
+    def scores_for_users(self, users):
+        for u in users:
+            yield numpy.copy(self.scores)
+
+
+class ProfileKNN(Model):
+    def __init__(self, n_users, n_items, U_features, K, active_users=None):
+        Model.__init__(self, n_users, n_items)
+        self.matrix = None
+        self.profiles = U_features
+        if active_users is None:
+            self.active_users = numpy.arange(n_users)
+        else:
+            self.active_users = numpy.asarray(active_users)
+        self.active_profile = self.profiles[active_users]
+        self.K = K
+
+    def train(self, train_dict):
+        import scipy.sparse
+        self.matrix = scipy.sparse.csr_matrix(dict_to_coo(train_dict, self.n_users, self.n_items))[self.active_users]
+
+    def scores_for_users(self, users):
+
+        sim_per_users = cosine_similarity(self.profiles[users, :], self.active_profile)
+        for sim in sim_per_users:
+            knn = numpy.argpartition(-sim, self.K)[0:self.K]
+            yield (sim[knn] * self.matrix[knn])
+
+    def params(self):
+        return super(ProfileKNN, self).params() + [["K", self.K]]
+
+
+class UserKNN(Model):
+    def __init__(self, n_users, n_items, K, active_users=None, metric="cosine"):
+        Model.__init__(self, n_users, n_items)
+        self.matrix = None
+        self.metric = metric
+        if active_users is None:
+            self.active_users = numpy.arange(n_users)
+        else:
+            self.active_users = numpy.asarray(active_users)
+        self.active_users_matrix = None
+        self.K = K
+
+    def train(self, train_dict):
+        import scipy.sparse
+        self.matrix = scipy.sparse.csr_matrix(dict_to_coo(train_dict, self.n_users, self.n_items))
+        self.active_users_matrix = self.matrix[self.active_users, :]
+
+    def scores_for_users(self, users):
+        if self.metric == "cosine":
+            sim_per_users = cosine_similarity(self.matrix[users, :], self.active_users_matrix)
+        else:
+            sim_per_users = 1 - pairwise_distances(self.matrix[users, :], self.active_users_matrix, metric=self.metric)
+        for sim in sim_per_users:
+            knn = numpy.argpartition(-sim, self.K)[0:self.K]
+            yield (sim[knn] * self.active_users_matrix[knn])
+
+    def params(self):
+        return super(UserKNN, self).params() + [["K", self.K]]
 
 
 class BPRModel(Model):
@@ -253,6 +369,8 @@ class BPRModel(Model):
                  batch_size=100000,
                  bias_init=0.0,
                  bias_range=(-numpy.Infinity, numpy.Infinity),
+
+                 max_norm=numpy.Infinity,
                  negative_sample_choice="max"):
 
         Model.__init__(self, n_users, n_items)
@@ -370,6 +488,7 @@ class BPRModel(Model):
         self.n_user_count = 4
         self.value_f = None
         self.warp_f = None
+        self.max_norm = max_norm
         self.negative_sample_choice = negative_sample_choice
 
     def params(self):
@@ -412,6 +531,8 @@ class BPRModel(Model):
         return updates
 
     def censor_updates(self):
+        if "max_norm" in self.__dict__ and self.max_norm != numpy.Infinity:
+            return [[self.V, self.max_norm], [self.U, self.max_norm]]
         return []
 
     def delta(self):
@@ -519,7 +640,7 @@ class BPRModel(Model):
         else:
             weights = T.repeat(
                 T.switch(violations > 0, T.cast(weights / violations, "float32"),
-                           T.zeros((violations.shape[0],), dtype="float32")),
+                         T.zeros((violations.shape[0],), dtype="float32")),
                 self.warp_count
             )
 
@@ -539,7 +660,7 @@ class BPRModel(Model):
                 borrow=True
             )
             gradient = T.grad(cost=cost, wrt=param, disconnected_inputs='ignore') / (
-            T.cast(dividend, "float32") + 1E-10)
+                T.cast(dividend, "float32") + 1E-10)
             if regularization_cost != 0:
                 gradient += T.grad(cost=regularization_cost, wrt=param, disconnected_inputs='ignore')
             new_history = ifelse(self.adagrad > 0, (history) + (gradient ** float(2)), history)
@@ -593,7 +714,7 @@ class BPRModel(Model):
             if self.warp_count > 1:
                 triplet, weights = self.warp_f(triplet)
             else:
-                weights = 1.0
+                weights = numpy.zeros(len(triplet), dtype="float32") + 1.0
             # update latent vectors
             loss, per_sample_losses = self.f(triplet, weights, adagrad_val)
             losses.append(loss)
@@ -607,8 +728,7 @@ class BPRModel(Model):
             sample_start = time.time()
 
     def __getstate__(self):
-        import copy
-        ret = copy.copy(self.__dict__)
+        ret = super(BPRModel, self).__getstate__()
         ret["f"] = None
         ret["validate_f"] = None
         ret["score_f"] = None
@@ -659,7 +779,8 @@ class KBPRModel(BPRModel):
                           warp_count=warp_count,
                           bias_init=bias_init,
                           bias_range=bias_range,
-                          negative_sample_choice=negative_sample_choice)
+                          negative_sample_choice=negative_sample_choice,
+                          max_norm=max_norm)
         self.K = K
         self.lambda_mean_distance = lambda_mean_distance
         self.lambda_variance = lambda_variance
@@ -669,7 +790,6 @@ class KBPRModel(BPRModel):
         self.update_density = update_density
         self.normalization = normalization
         self.variance_mu = variance_mu
-        self.max_norm = max_norm
 
         if mixture_density is None:
             self.mixture_density = theano.shared(
@@ -719,9 +839,6 @@ class KBPRModel(BPRModel):
             self.user_sample_counts = T.inc_subtensor(self.user_sample_counts[self.neg_i_cluster], one)
 
         self.init_f = None
-
-    def censor_updates(self):
-        return super(KBPRModel, self).censor_updates() + [[self.V, self.max_norm], [self.U, self.max_norm]]
 
     def updates(self):
 
@@ -810,7 +927,7 @@ class KBPRModel(BPRModel):
         v_norm_wide = self.V_norm.reshape((self.n_items, 1, 1, self.n_factors))  # (items, 1, ,1, factors)
         distance = ((self.U_norm_wide[:, self.i, :] - v_norm_wide) ** 2).sum(axis=3)  # (items, K, users)
         normal = -(distance / (2 * ((variance[:, :, self.i] * item_variance) ** 2))) - (
-        T.log((item_variance * variance[:, :, self.i]) ** 2) / 2)
+            T.log((item_variance * variance[:, :, self.i]) ** 2) / 2)
         return (normal + portion[:, :, self.i]).max(axis=1).T  # transpose (items, users) to (users, items)
 
     def kmean(self, train_dict, K, user_batch=5000):
@@ -938,7 +1055,6 @@ class KBPRModel(BPRModel):
                 break
         return numpy.transpose(numpy.concatenate(all_clusters), axes=[1, 0, 2]).reshape(
             (K * self.n_users, self.n_factors))
-
 
     def initialize(self, train_dict, epoch=1, adagrad=True, profile=False, exclude_items=None):
         if self.init_f is None:
@@ -1078,6 +1194,7 @@ class VisualKBPRAbstract(KBPRModel):
                     name=name,
                     borrow=True
                 )
+
         self.V_features = to_tensor(V_features, "V_features")
         # item embedding (optional)
         if items_with_features is None:
@@ -1234,8 +1351,8 @@ class VisualFactorKBPR(VisualKBPRAbstract):
 
     def l2_reg(self):
         reg = super(VisualFactorKBPR, self).l2_reg()
-        #has_features = (self.V_features ** 2).sum(1).nonzero()
-        #reg += [[(self.V - self.V_embedding(numpy.arange(self.n_items)))[has_features], self.lambda_v_off]]
+        # has_features = (self.V_features ** 2).sum(1).nonzero()
+        # reg += [[(self.V - self.V_embedding(numpy.arange(self.n_items)))[has_features], self.lambda_v_off]]
         reg += [[(self.V - self.V_embedding(numpy.arange(self.n_items))), self.lambda_v_off]]
         # reg += [[(self.U[self.i] - self.V_embedding[self.j_pos]), 0.0001, 1]]
         if self.U_embedding is not None:
@@ -1276,7 +1393,7 @@ class VisualFactorKBPR(VisualKBPRAbstract):
 
 class LightFMModel(Model):
     def __init__(self, n_factors, n_users, n_items, V_features=None, lambda_u=0.0, lambda_v=0.0, learning_rate=0.01,
-                 loss="warp_count",
+                 loss="warp",
                  use_bias=True, normalize_features=False, exclude_items=None):
 
         super(LightFMModel, self).__init__(n_users, n_items)
@@ -1286,6 +1403,14 @@ class LightFMModel(Model):
         self.use_bias = use_bias
         self.learning_rate = learning_rate
         self.normalize_features = normalize_features
+        self.n_factors = n_factors
+        self.lambda_u = lambda_u
+        self.lambda_v = lambda_v
+        self.loss = loss
+        self.U = None
+        self.V = None
+        self.score_f = None
+        self.with_features = V_features is not None
         from scipy.sparse import coo_matrix, csr_matrix
         if exclude_items is None:
             exclude_items = set()
@@ -1349,6 +1474,7 @@ class LightFMModel(Model):
         ]
 
     def train(self, train_dict, epoch=1, adagrad=False, hard_case=False):
+        self.V = self.U = self.score_f = None
         if self.train_coo is None:
             self.check_signature(train_dict)
             self.train_coo = dict_to_coo(train_dict, self.n_users, self.n_items)
@@ -1361,7 +1487,288 @@ class LightFMModel(Model):
 
     def scores_for_users(self, users):
         import multiprocessing
+        if "U" not in self.__dict__ or self.U is None:
+            if self.V_features_orig is not None:
+                V = self.V_features_orig.dot(self.model.item_embeddings)
+                bias = self.V_features_orig.dot(self.model.item_biases)
+            else:
+                V = self.model.item_embeddings
+                bias = self.model.item_biases
+            self.V = theano.shared(numpy.concatenate(
+                (V, bias.reshape((self.n_items, 1))), axis=1))
+            self.U = theano.shared(numpy.concatenate(
+                (self.model.user_embeddings, numpy.ones((self.n_users, 1), dtype="float32")), axis=1))
+            u = theano.tensor.iscalar()
+            self.score_f = theano.function([u], T.dot(self.U[u], self.V.T))
         for u in users:
-            yield self.model.predict(u, numpy.arange(self.n_items),
-                                     num_threads=multiprocessing.cpu_count(),
-                                     item_features=self.V_features_orig)
+            # group_truth = self.model.predict(u, numpy.arange(self.n_items),
+            #                          num_threads=multiprocessing.cpu_count(),
+            #                          item_features=self.V_features_orig)
+            # error = numpy.nonzero(numpy.argsort(numpy.argsort(group_truth)) - numpy.argsort(numpy.argsort(scores)))
+            yield self.score_f(u)
+
+    def __getstate__(self):
+        ret = super(LightFMModel, self).__getstate__()
+        ret["U"] = None
+        ret["V"] = None
+        ret["score_f"] = None
+
+        return ret
+
+
+class BPRModelWithUserProfile(BPRModel):
+    def __init__(self, n_factors, n_users, n_items, U_features, n_active_user, U=None, V=None, b=None, U_mlp=None,
+                 margin=1,
+                 use_bias=True,
+                 warp_count=20,
+                 lambda_u=0.0,
+                 lambda_v=0.0,
+                 lambda_bias=0.0,
+                 bias_init=0.0,
+                 lambda_weight_l1=0,
+                 lambda_weight_l2=0,
+                 n_layers=2,
+                 width=256,
+                 learning_rate=0.1,
+                 bias_range=(-numpy.Infinity, numpy.Infinity),
+                 user_embedding_rescale=1.0,
+                 batch_size=200000,
+                 negative_sample_choice="max",
+                 dropout_rate=0.5,
+                 lambda_u_off=1):
+        BPRModel.__init__(self, n_factors, n_users, n_items, U, V, b, lambda_u, lambda_v, lambda_bias,
+                          use_bias=use_bias,
+                          use_factors=True,
+                          loss_f="hinge",
+                          margin=margin,
+                          learning_rate=learning_rate,
+                          batch_size=batch_size,
+                          warp_count=warp_count,
+                          bias_init=bias_init,
+                          bias_range=bias_range,
+                          negative_sample_choice=negative_sample_choice,
+                          )
+
+        # User embedding (optional)
+        def to_tensor(m, name):
+            if scipy.sparse.issparse(m):
+                return theano.sparse.shared(
+                    value=m,
+                    name=name,
+                    borrow=True
+                )
+            else:
+                return theano.shared(
+                    value=m.astype(theano.config.floatX),
+                    name=name,
+                    borrow=True
+                )
+
+        self.n_active_user = n_active_user
+        self.U_features = to_tensor(U_features, "U_features")
+        self.n_layers = n_layers
+        self.width = width
+        if U_mlp is None:
+            self.U_mlp = MLP(U_features.shape[1], n_factors, T.cast(self.n_users, "float32"),
+                             lambda_weight_l1=lambda_weight_l1,
+                             lambda_weight_l2=lambda_weight_l2, n_layers=n_layers, width=width)
+        else:
+            self.U_mlp = U_mlp.copy()
+            self.U_mlp.usage_count = T.cast(self.n_users, "float32")
+        self.user_embedding_rescale = user_embedding_rescale
+        self.dropout_rate = dropout_rate
+        self.U_embedding = self.U_mlp.projection(self.U_features, self.user_embedding_rescale, numpy.Infinity,
+                                                 dropout_rate=self.dropout_rate, training=True)
+        self.U_embedding_full = self.U_mlp.projection(self.U_features, self.user_embedding_rescale, numpy.Infinity,
+                                                      dropout_rate=1, training=False)
+        self.lambda_u_off = lambda_u_off
+        self.update_f = None
+        if U is None and self.U_embedding is not None:
+            embedding = self.U_embedding(numpy.arange(n_users))
+            theano.function([], [], updates=[[self.U, embedding]])()
+
+    def params(self):
+        return super(BPRModelWithUserProfile, self).params() + [
+            ["width", self.width],
+            ["dropout_rate", self.dropout_rate],
+            ["layers", self.n_layers],
+            ["l_u_off", self.lambda_u_off]
+        ]
+
+    def updates(self):
+        updates = super(BPRModelWithUserProfile, self).updates()
+        updates += self.U_mlp.updates()
+        return updates
+
+    def l2_reg(self):
+        reg = super(BPRModelWithUserProfile, self).l2_reg()
+        reg += [[(self.U - self.U_embedding(numpy.arange(self.n_users)))[0:self.n_active_user], self.lambda_u_off]]
+        reg += self.U_mlp.l2_reg()
+        return reg
+
+    def l1_reg(self):
+        reg = super(BPRModelWithUserProfile, self).l1_reg()
+        reg += self.U_mlp.l1_reg()
+        return reg
+
+    def before_eval(self):
+        super(BPRModelWithUserProfile, self).before_eval()
+        if self.U_embedding is not None:
+            if self.update_f is None:
+                print "Use non-dropout version"
+                updates = [[self.U, T.set_subtensor(self.U[self.n_active_user:],
+                                                    self.U_embedding_full(numpy.arange(self.n_users))[
+                                                    self.n_active_user:])]]
+                self.update_f = theano.function([], [], updates=updates)
+            self.update_f()
+        return
+
+    def __getstate__(self):
+        ret = super(BPRModelWithUserProfile, self).__getstate__()
+        # remove V_feature from the serialization
+        ret["V_features"] = None
+        ret["V_embedding"] = None
+        ret["U_features"] = None
+        ret["U_embedding"] = None
+        ret["update_f"] = None
+        ret["U_embedding_full"] = None
+
+        return ret
+
+
+class VisualOffsetBPR(BPRModel):
+    def __init__(self, n_factors, n_users, n_items, V_features, U_features=None, items_with_features=None, U=None,
+                 V=None, V_mlp=None,
+                 U_mlp=None,
+                 b=None, margin=1,
+                 use_bias=True,
+                 warp_count=10,
+                 lambda_u=0.0,
+                 lambda_v=0.0,
+                 lambda_bias=0.1,
+                 lambda_weight_l2=0.00001,
+                 lambda_weight_l1=0.0000,
+                 n_layers=2,
+                 learning_rate=0.01,
+                 batch_size=200000,
+                 max_norm=numpy.Inf,
+                 embedding_rescale=0.04,
+                 user_embedding_rescale=0.01,
+                 width=128,
+                 dropout_rate=0.5,
+                 loss_f="hinge",
+                 lambda_v_off=1):
+
+        super(VisualOffsetBPR, self).__init__(n_factors, n_users, n_items,
+                                              U=U, V=V, b=b, margin=margin,
+                                              use_bias=use_bias,
+                                              warp_count=warp_count,
+                                              lambda_u=lambda_u,
+                                              lambda_v=lambda_v,
+                                              learning_rate=learning_rate,
+                                              batch_size=batch_size,
+                                              max_norm=max_norm,
+                                              loss_f=loss_f,
+                                              lambda_b=lambda_bias,
+
+                                              )
+        self.width = width
+        self.dropout_rate = dropout_rate
+        self.n_layers = n_layers
+        self.lambda_v_off = lambda_v_off
+        import theano.sparse
+        import scipy.sparse
+        def to_tensor(m, name):
+            if scipy.sparse.issparse(m):
+                return theano.sparse.shared(
+                    value=m,
+                    name=name,
+                    borrow=True
+                )
+            else:
+                return theano.shared(
+                    value=m.astype(theano.config.floatX),
+                    name=name,
+                    borrow=True
+                )
+
+        self.V_features = to_tensor(V_features, "V_features")
+        # item embedding (optional)
+        if items_with_features is None:
+            self.items_with_features = numpy.arange(n_items)
+        else:
+            self.items_with_features = numpy.asarray(items_with_features, dtype="int64")
+
+        if V_mlp is None:
+            self.V_mlp = MLP(V_features.shape[1], self.n_factors, T.cast(self.n_items, "float32"),
+                             lambda_weight_l1=lambda_weight_l1,
+                             lambda_weight_l2=lambda_weight_l2, n_layers=n_layers, width=width)
+        else:
+            self.V_mlp = V_mlp.copy()
+            self.V_mlp.usage_count = T.cast(self.n_items, "float32")
+        self.embedding_rescale = embedding_rescale
+        self.V_embedding = self.V_mlp.projection(self.V_features, self.embedding_rescale, self.max_norm,
+                                                 dropout_rate=self.dropout_rate, training=True)
+
+        # User embedding (optional)
+        if U_features is not None:
+            self.U_features = to_tensor(U_features, "U_features")
+
+            if U_mlp is None:
+                self.U_mlp = MLP(U_features.shape[1], n_factors, T.cast(self.n_users, "float32"),
+                                 lambda_weight_l1=lambda_weight_l1,
+                                 lambda_weight_l2=lambda_weight_l2, n_layers=n_layers, width=width)
+            else:
+                self.U_mlp = U_mlp.copy()
+                self.U_mlp.usage_count = T.cast(self.n_users, "float32")
+            self.user_embedding_rescale = user_embedding_rescale
+            self.U_embedding = self.U_mlp.projection(self.U_features, self.user_embedding_rescale, self.max_norm,
+                                                     dropout_rate=self.dropout_rate, training=True)
+        else:
+            self.U_features = None
+            self.U_embedding = None
+            self.U_mlp = None
+
+    def l2_reg(self):
+        reg = super(VisualOffsetBPR, self).l2_reg()
+        if self.U_mlp is not None:
+            reg += self.U_mlp.l2_reg()
+        reg += self.V_mlp.l2_reg()
+        reg += [[(self.V - self.V_embedding(numpy.arange(self.n_items))), self.lambda_v_off]]
+        if self.U_embedding is not None:
+            reg += [
+                [(self.U - self.U_embedding(numpy.arange(self.n_users))),
+                 self.lambda_v_off]]
+
+        return reg
+
+    def l1_reg(self):
+        reg = super(VisualOffsetBPR, self).l1_reg()
+        if self.U_mlp is not None:
+            reg += self.U_mlp.l1_reg()
+        reg += self.V_mlp.l1_reg()
+        return reg
+
+    def params(self):
+        return super(VisualOffsetBPR, self).params() + [
+            ["width", self.width],
+            ["dropout_rate", self.dropout_rate],
+            ["layers", self.n_layers]
+        ]
+
+    def updates(self):
+        updates = super(VisualOffsetBPR, self).updates()
+        updates += self.V_mlp.updates()
+        if self.U_embedding is not None:
+            updates += self.U_mlp.updates()
+
+        return updates
+
+    def __getstate__(self):
+        ret = super(VisualOffsetBPR, self).__getstate__()
+        # remove V_feature from the serialization
+        ret["V_features"] = None
+        ret["V_embedding"] = None
+        ret["U_features"] = None
+        ret["U_embedding"] = None
+        return ret

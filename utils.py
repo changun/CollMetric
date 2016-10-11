@@ -112,7 +112,7 @@ def early_stopping(model, train_dict, valid_dict, exclude_dict, metric_fn, pre="
     return best_metric
 
 
-def early_stop(model, train_dict_bc, metric_fn, n_epochs=2000, validation_frequency=100, patience=300, **kwargs):
+def early_stop(model, train_dict_bc, metric_fn, n_epochs=2000, validation_frequency=100, patience=300, dynamic=False, **kwargs):
     import cStringIO, numpy
     import theano.misc.pkl_utils
     output = None
@@ -122,14 +122,14 @@ def early_stop(model, train_dict_bc, metric_fn, n_epochs=2000, validation_freque
     while True:
         model.train(train_dict_bc, epoch=validation_frequency,  **kwargs)
         new_metric = metric_fn(model)
-        if new_metric > best_metric:
+        if new_metric >= best_metric:
             # worse than the best metric
             patience_count -= validation_frequency
             print ("Patience %d" % (patience_count,))
-            # if "f" in model.__dict__ and model.learning_rate > 0.01:
-            #      model.learning_rate = 0.01
-            #      print "New learning rate %g" % (model.learning_rate,)
-            #      model.f = None
+            if "f" in model.__dict__ and model.learning_rate > 0.01 and dynamic:
+                 model.learning_rate = 0.01
+                 print "New learning rate %g" % (model.learning_rate,)
+                 model.f = None
         else:
 
 
@@ -146,8 +146,19 @@ def early_stop(model, train_dict_bc, metric_fn, n_epochs=2000, validation_freque
         if patience_count <= 0 or n_epochs <= 0:
             if output is not None:
                 best_model = theano.misc.pkl_utils.load(output)
+                print "Best model"
+                print metric_fn(best_model)
                 return best_model
             return None
+
+def popular_items(train_dict, percentile=90):
+    item_counts = defaultdict(int)
+    for user, items in train_dict.items():
+        for i in items:
+            item_counts[i] += 1
+    thres = numpy.percentile(item_counts.values(), percentile)
+    print thres
+    return [item for item, count in item_counts.items() if count > thres]
 
 def data_to_dict(data):
     data_dict = defaultdict(set)
@@ -1347,58 +1358,27 @@ def medium_details(titles):
                 "url": "https://medium.com/articles/" + titles[id].split("/")[0]}
     return details
 
-# for i in numpy.random.randint(n_users_l, size=50):
-#     if len(list(train_dict_l[i])) > 20:
-#         print i, gap_statistic(m_f.V.get_value()[list(train_dict_l[i])])
-# import gc
-# out = []
-# for n_factor in [10, 20, 30, 40]:
-#     for i in range(10):
-#         numpy.random.seed()
-#         cov = 10 ** numpy.random.uniform(-1, 2)
-#         bias = 10 ** numpy.random.uniform(-1, 1)
-#         variance = 10 ** numpy.random.uniform(-1, 2)
-#         gc.collect()
-#         gc.collect()
-#         model = KBPRModel(n_factor, n_users_n, n_items_n,
-#                               batch_size=100000, lambda_v=0.0, lambda_u=0.0,
-#                                per_user_sample=20,
-#                                learning_rate=0.1,
-#                                variance_mu=1.0, uneven_sample=True,
-#                                update_mu=True,
-#                                lambda_variance=variance,
-#                                warp_count=20, max_norm=1.1, K=1, lambda_bias=bias, lambda_cov=cov, margin=.5, lambda_density=0.0001,
-#                                bias_range=(1E-6, 10))
-#         out.append(early_stop(model, train_dict_n, lambda m: -m.recall(valid_dict_n, train_dict_n, n_users=3000)[0][0],
-#                    patience=1000, validation_frequency=250, n_epochs=10000000, adagrad=True))
-#         numpy.random.seed()
-#         v = 10 ** numpy.random.uniform(-10, -4)
-#         fm = LightFMModel(n_factor, n_users_n, n_items_n, lambda_v=v)
-#         out.append(early_stop(fm, train_dict_n, lambda m: -m.recall(valid_dict_n, train_dict_n, n_users=3000)[0][0],
-#                               patience=300, validation_frequency=50, n_epochs=10000000, adagrad=True))
-#
-#
-#
-# out = []
-# for factors in [50, 20, 10]:
-#     for bias, var in [[0.8, 0.5], [0.5, 0.5], [0.1, 0.5], [0.5, 0.3], [0.5, 0.1]]:
-#         lastfm_50 = KBPRModel(factors, n_users_l, n_items_l, batch_size=100000, lambda_v=0.0, lambda_u=0.0,
-#                               per_user_sample=20,
-#                               learning_rate=0.1,
-#                               variance_mu=1.0, uneven_sample=True,
-#                               update_mu=True,
-#                               lambda_variance=var,
-#                               warp_count=20, max_norm=1.1, K=1, lambda_bias=bias, lambda_cov=1, margin=.5, lambda_density=0.0001,
-#                               bias_range=(1E-6, 10))
-#         out.append(early_stop(lastfm_50, train_dict_l, lambda m: -m.recall(valid_dict_l, train_dict_l, n_users=3000)[0][0],
-#                    patience=2000, validation_frequency=150, n_epochs=10000000, adagrad=True))
-# out = []
-# for i in range(10):
-#     u = 10 ** -numpy.random.uniform(3, 8)
-#     medium_fm = LightFMModel(50, n_users_m, n_items_m, lambda_v=u, lambda_u=u)
-#     out.append(early_stop(medium_fm, train_dict_m, lambda m: -m.recall(valid_dict_m, train_dict_m, n_users=3000)[0][0],
-#                patience=200, validation_frequency=50, n_epochs=10000000, adagrad=True))
+def yelp():
+    import cPickle
+    import numpy
+    import sklearn.preprocessing
 
+    def to_dict(list_of_list, start_i = 0):
+        ret = {}
+        for i, items in enumerate(list_of_list):
+            ret[i+start_i] = set(items)
+        return ret
+    train_dat = cPickle.load(open("../yelp/rec_visits_train_list.p"))
+    train = to_dict(train_dat[0:-1000])
+    valid = to_dict(train_dat[-1000:], len(train_dat[0:-1000]))
+    test = to_dict(cPickle.load(open("../yelp/rec_visits_val_list.p")), len(train_dat))
+    max_id = 0
+    for dat in [train, valid, test]:
+        for items in dat.values():
+            for i in items:
+              max_id = max(max_id, i)
+    U_features = numpy.concatenate([numpy.load("../yelp/train_features.npy"), numpy.load("../yelp/val_features.npy")], axis=0)
+    return len(U_features), max_id+1, train, valid, test, U_features
 
 def lsh(dataset, distance='euclidean_squared', lsh_family="cross_polytope", n_hash_bits=18, n_rotations=1, n_tables=50):
     # or negative_inner_product
@@ -1424,8 +1404,7 @@ def lsh(dataset, distance='euclidean_squared', lsh_family="cross_polytope", n_ha
     return table
 
 def concate(fm, type="bias"):
-    V = numpy.concatenate((fm.model.item_embeddings, fm.model.item_biases.reshape((fm.model.item_embeddings.shape[0], 1))), axis=1)
-    U = numpy.concatenate((fm.model.user_embeddings, numpy.ones((fm.model.user_embeddings.shape[0], 1), dtype="float32")), axis=1)
+
     U /=  ((U ** 2).sum(1) ** 0.5).reshape((U.shape[0], 1))
     V /=  ((V ** 2).sum(1) ** 0.5).max()
     if type == "bias":
@@ -1557,10 +1536,13 @@ def save(dataset, model, n_users, n_items, train_dict, valid_dict, test_dict, ex
 
     if not fs.exists(attr["_id"]):
         print str("Save " + str(model))
+        fs.delete(attr["_id"])
         with fs.new_file(**attr) as out:
             with io.BytesIO() as bytesBuffer:
                 theano.misc.pkl_utils.dump(model, bytesBuffer)
                 out.write(bytesBuffer.getvalue())
+        # evalute the model
+        eval_one(attr["_id"])
 
 def save_batch(filenames, dataset, n_users, n_items, train_dict, valid_dict, test_dict, exclude_dict, cold_dict, popular, cold, **kargs):
     import theano.misc.pkl_utils, os
@@ -1572,23 +1554,37 @@ def save_batch(filenames, dataset, n_users, n_items, train_dict, valid_dict, tes
         for m in ms:
             model = m["model"]
             save(dataset, model, n_users, n_items, train_dict, valid_dict, test_dict, exclude_dict, cold_dict, popular, cold, **kargs)
+def load_dataset(dataset_id):
+    import theano.misc.pkl_utils
+    from pymongo import MongoClient
+    import gridfs
+    db = MongoClient().models
+    dataset_db = MongoClient().datasets
+    dataset_fs = gridfs.GridFS(dataset_db)
 
-def eval_one(id):
+    dataset = theano.misc.pkl_utils.load(dataset_fs.get(dataset_id))
+    train, valid, test, exclude = coo_to_dict(dataset["train_dict"]), \
+                                  coo_to_dict(dataset["valid_dict"]), \
+                                  coo_to_dict(dataset["test_dict"]), \
+                                  coo_to_dict(dataset["exclude_dict"])
+    return train, valid, test, exclude
+def load_model(id):
     import theano.misc.pkl_utils
     from pymongo import MongoClient
     import gridfs
     db = MongoClient().models
     fs = gridfs.GridFS(db)
-    dataset_db = MongoClient().datasets
-    dataset_fs = gridfs.GridFS(dataset_db)
+
     model_record = db["fs.files"].find_one(id)
-    dataset_id = model_record["dataset_id"]
-    dataset = theano.misc.pkl_utils.load(dataset_fs.get(dataset_id))
     model = theano.misc.pkl_utils.load(fs.get(id))
-    train, valid, test, exclude = coo_to_dict(dataset["train_dict"]), \
-                                  coo_to_dict(dataset["valid_dict"]), \
-                                  coo_to_dict(dataset["test_dict"]), \
-                                  coo_to_dict(dataset["exclude_dict"])
+    train, valid, test, exclude = load_dataset(model_record["dataset_id"])
+    return model, train, valid, test, exclude
+def eval_one(id):
+    from pymongo import MongoClient
+    model, train, valid, test, exclude = load_model(id)
+    db = MongoClient().models
+    model_record = db["fs.files"].find_one(id)
+    print "Eval " + model_record["name"]
     [[valid_recall_100, valid_recall_100_sem],
      [valid_recall_50, valid_recall_50_sem],
      [valid_recall_10, valid_recall_10_sem]
@@ -1614,11 +1610,43 @@ def eval_one(id):
     db["fs.files"].save(model_record)
     print "Save " + model_record["name"]
 
-def eval_batch():
+
+def eval_one_for_cold_items(id):
     from pymongo import MongoClient
+    model, train, valid, test, exclude = load_model(id)
     db = MongoClient().models
-    for model_record in db["fs.files"].find({"valid_recall_100": {'$exists': False}, "class": {'$ne': "LightFMModel"}}):
-        eval_one(model_record["_id"])
+    model_record = db["fs.files"].find_one(id)
+    print "Eval " + model_record["name"]
+
+
+    [[test_recall_100, test_recall_100_sem],
+     [test_recall_50, test_recall_50_sem],
+     [test_recall_10, test_recall_10_sem]
+     ] = model.recall(test, merge_dict(merge_dict(train, valid), exclude), exclude_items=popular_items(train, 90), n_users=min(len(test),30000))
+
+    model_record["test_recall_100_90p_30000s"] = test_recall_100
+    model_record["test_recall_50_90p_30000s"] = test_recall_50
+    model_record["test_recall_10_90p_30000s"] = test_recall_10
+    model_record["test_recall_100_sem_90p_30000s"] = test_recall_100_sem
+    model_record["test_recall_50_sem_90p_30000s"] = test_recall_50_sem
+    model_record["test_recall_10_sem_90p_30000s"] = test_recall_10_sem
+
+    [[test_recall_100, test_recall_100_sem],
+     [test_recall_50, test_recall_50_sem],
+     [test_recall_10, test_recall_10_sem]
+     ] = model.recall(test, merge_dict(merge_dict(train, valid), exclude), exclude_items=popular_items(train, 95),
+                      n_users=min(len(test), 30000))
+
+    model_record["test_recall_100_95p_30000s"] = test_recall_100
+    model_record["test_recall_50_95p_30000s"] = test_recall_50
+    model_record["test_recall_10_95p_30000s"] = test_recall_10
+    model_record["test_recall_100_sem_95p_30000s"] = test_recall_100_sem
+    model_record["test_recall_50_sem_95p_30000s"] = test_recall_50_sem
+    model_record["test_recall_10_sem_95p_30000s"] = test_recall_10_sem
+
+    db["fs.files"].save(model_record)
+    print "Save " + model_record["name"]
+
 
 
 
