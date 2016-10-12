@@ -38,7 +38,7 @@ for n_factors in (100, 10, 40, 70):
                              embedding_rescale=1, batch_size=100000)
 
     train_and_save(model)
-    gc.collect()
+
 
 ### LightFM
 # name = "LastFM_LightFM_N_Factors_10.p"

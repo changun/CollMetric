@@ -1185,7 +1185,7 @@ class VisualKBPRAbstract(KBPRModel):
         def to_tensor(m, name):
             if scipy.sparse.issparse(m):
                 return theano.sparse.shared(
-                    value=m,
+                    value=scipy.sparse.csr_matrix(m, dtype="float32"),
                     name=name,
                     borrow=True
                 )
@@ -1554,7 +1554,7 @@ class BPRModelWithUserProfile(BPRModel):
         def to_tensor(m, name):
             if scipy.sparse.issparse(m):
                 return theano.sparse.shared(
-                    value=m,
+                    value=scipy.sparse.csr_matrix(m, dtype="float32"),
                     name=name,
                     borrow=True
                 )
@@ -1682,7 +1682,7 @@ class VisualOffsetBPR(BPRModel):
         def to_tensor(m, name):
             if scipy.sparse.issparse(m):
                 return theano.sparse.shared(
-                    value=m,
+                    value=scipy.sparse.csr_matrix(m, dtype="float32"),
                     name=name,
                     borrow=True
                 )
@@ -1772,4 +1772,133 @@ class VisualOffsetBPR(BPRModel):
         ret["V_embedding"] = None
         ret["U_features"] = None
         ret["U_embedding"] = None
+        return ret
+
+
+
+class VisualBPR(BPRModel):
+    def __init__(self, n_factors, n_users, n_items, V_features,  items_with_features=None, U=None,
+                 V=None, V_mlp=None,
+
+                 b=None, margin=1,
+                 use_bias=True,
+                 warp_count=10,
+                 lambda_u=0.0,
+                 lambda_v=0.0,
+                 lambda_bias=0.1,
+                 lambda_weight_l2=0.00001,
+                 lambda_weight_l1=0.0000,
+                 n_layers=2,
+                 learning_rate=0.01,
+                 batch_size=200000,
+                 max_norm=numpy.Inf,
+                 embedding_rescale=0.04,
+                 width=128,
+                 dropout_rate=0.5,
+                 loss_f="hinge"):
+
+        super(VisualBPR, self).__init__(n_factors, n_users, n_items,
+                                              U=U, V=V, b=b, margin=margin,
+                                              use_bias=use_bias,
+                                              warp_count=warp_count,
+                                              lambda_u=lambda_u,
+                                              lambda_v=lambda_v,
+                                              learning_rate=learning_rate,
+                                              batch_size=batch_size,
+                                              max_norm=max_norm,
+                                              loss_f=loss_f,
+                                              lambda_b=lambda_bias,
+
+                                              )
+        self.width = width
+        self.dropout_rate = dropout_rate
+        self.n_layers = n_layers
+        import theano.sparse
+        import scipy.sparse
+        def to_tensor(m, name):
+            if scipy.sparse.issparse(m):
+                return theano.sparse.shared(
+                    value=scipy.sparse.csr_matrix(m, dtype="float32"),
+                    name=name,
+                    borrow=True
+                )
+            else:
+                return theano.shared(
+                    value=m.astype(theano.config.floatX),
+                    name=name,
+                    borrow=True
+                )
+
+        self.V_features = to_tensor(V_features, "V_features")
+        # item embedding (optional)
+        if items_with_features is None:
+            self.items_with_features = numpy.arange(n_items)
+        else:
+            self.items_with_features = numpy.asarray(items_with_features, dtype="int64")
+
+        if V_mlp is None:
+            self.V_mlp = MLP(V_features.shape[1], self.n_factors, T.cast(self.n_items, "float32"),
+                             lambda_weight_l1=lambda_weight_l1,
+                             lambda_weight_l2=lambda_weight_l2, n_layers=n_layers, width=width)
+        else:
+            self.V_mlp = V_mlp.copy()
+            self.V_mlp.usage_count = T.cast(self.n_items, "float32")
+
+        self.U_Visual = theano.shared(
+            value=numpy.random.normal(0, 1 / (n_factors ** 0.5), (n_users, n_factors)).astype(
+                theano.config.floatX) / 5,
+            name='U',
+            borrow=True
+        )
+
+        self.embedding_rescale = embedding_rescale
+        self.V_embedding = self.V_mlp.projection(self.V_features, self.embedding_rescale, self.max_norm,
+                                                 dropout_rate=self.dropout_rate, training=True)(numpy.arange(self.n_items))
+
+    def l2_reg(self):
+        reg = super(VisualBPR, self).l2_reg()
+        reg += self.V_mlp.l2_reg()
+        if self.lambda_u != 0.0:
+            reg.append((self.U_Visual, self.lambda_u))
+        if self.lambda_v != 0.0:
+            reg.append((self.V_embedding, self.lambda_v))
+
+        return reg
+
+    def l1_reg(self):
+        reg = super(VisualBPR, self).l1_reg()
+        reg += self.V_mlp.l1_reg()
+        return reg
+
+    def params(self):
+        return super(VisualBPR, self).params() + [
+            ["width", self.width],
+            ["dropout_rate", self.dropout_rate],
+            ["layers", self.n_layers]
+
+        ]
+
+    def updates(self):
+        updates = super(VisualBPR, self).updates()
+        updates += self.V_mlp.updates()
+        updates += [[self.U_Visual, self.user_sample_counts]]
+        return updates
+
+    def factor_delta(self):
+        # user vector
+        delta = super(VisualBPR, self).factor_delta() + \
+                (self.U_Visual[self.i] * (self.V_embedding[self.j_pos] - self.V_embedding[self.j_neg])).sum(axis=1)
+        return delta
+
+    def scores_ij(self, i, j):
+        return super(VisualBPR, self).scores_ij(i, j) + (self.U_Visual[i] * (self.V_embedding[j])).sum(axis=1)
+
+    def factor_score(self):
+        return super(VisualBPR, self).factor_score() + T.dot(self.U_Visual[self.i], self.V_embedding.T)
+
+    def __getstate__(self):
+        ret = super(VisualBPR, self).__getstate__()
+        # remove V_feature from the serialization
+        ret["V_features"] = None
+        ret["V_embedding"] = None
         return ret

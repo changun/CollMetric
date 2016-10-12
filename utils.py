@@ -1329,10 +1329,15 @@ def medium(thres=10):
     user_counts = defaultdict(int)
     user_ids = {}
     doc_ids = {}
+
     user_doc = json.load(open("/data/dataset/user-doc.json"))
     articles = json.load(open("/data/dataset/articles.json"))
+    topics = numpy.load("/data/dataset/topics.npy")
+
     doc_titles = dict([(a['id'], a['title']) for a in articles])
     article_tags = dict([(a['id'], a['tags']) for a in articles])
+    article_orig_index = dict([(a['id'], index) for a, index in zip(articles, range(len(articles)))])
+    orig_index = []
     titles = []
     feature_dict = defaultdict(set)
     for u, d in user_doc:
@@ -1344,12 +1349,15 @@ def medium(thres=10):
                 user_dict[user_ids[u]] = set()
             if d not in doc_ids:
                 doc_ids[d] = len(doc_ids)
+                orig_index.append(article_orig_index[d])
                 titles.append(d + "/" + doc_titles[d])
                 for tag in article_tags[d]:
                     feature_dict[doc_ids[d]].add(tag["name"])
             user_dict[user_ids[u]].add(doc_ids[d])
     features, labels = feature_sets_to_array(feature_dict, 10, n_items=len(doc_ids))
-    return user_dict, features, labels, titles
+    topics = topics[orig_index]
+
+    return user_dict, features, topics, labels, titles
 
 
 def medium_details(titles):

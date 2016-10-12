@@ -3,9 +3,9 @@ from utils import *
 import theano.misc.pkl_utils
 
 
-user_dict_l, features_l, labels, to_title = movielens20M(min_rating=4.0, user_rating_count=10, tag_freq_thres=20, use_director=False)
-n_items_l, n_users_l, train_dict_l, valid_dict_l, test_dict_l, exclude_dict_l, cold_dict_l, popular_l, cold_l = preprocess(
-     user_dict_l, [3, 1, 1])
+# user_dict_l, features_l, labels, to_title = movielens20M(min_rating=4.0, user_rating_count=10, tag_freq_thres=20, use_director=False)
+# n_items_l, n_users_l, train_dict_l, valid_dict_l, test_dict_l, exclude_dict_l, cold_dict_l, popular_l, cold_l = preprocess(
+#      user_dict_l, [3, 1, 1])
 
 
 def load_data():
@@ -34,22 +34,23 @@ def train_and_save(model):
          popular_l,  cold_l, subject_thres=5, min_rating=4.0, user_rating_count=10, tag_freq_thres=20, use_director=False)
 
 ## LightFM
-for n_factors in (100, 10, 40, 70):
-    model = LightFMModel(n_factors, n_users_l, n_items_l, lambda_u=0, lambda_v=1E-5, loss="warp")
-    train_and_save(model)
-    model = LightFMModel(n_factors, n_users_l, n_items_l, lambda_u=1E-4, lambda_v=1E-4, loss="warp")
-    train_and_save(model)
+#for n_factors in (100, 10, 40, 70):
+    # model = LightFMModel(n_factors, n_users_l, n_items_l, lambda_u=0, lambda_v=1E-5, loss="warp")
+    # train_and_save(model)
+    # model = LightFMModel(n_factors, n_users_l, n_items_l, lambda_u=1E-4, lambda_v=1E-4, loss="warp")
+    # train_and_save(model)
 
-## KBPR
-for n_factors in (100,):
-    model = KBPRModel(n_factors, n_users_l, n_items_l,
-                      margin=0.5, lambda_variance=10.0, lambda_bias=0.1, max_norm=1.0, warp_count=20, lambda_cov=10)
+## BPR
+for n_factors in (100, 10, 40, 70):
+    model = BPRModel(n_factors, n_users_l, n_items_l,
+                            lambda_u=1, lambda_v=1, lambda_b=1,
+                             margin=1.0, learning_rate=.01,
+                             batch_size=200000, loss_f="sigmoid", warp_count=1)
     train_and_save(model)
-    model = KBPRModel(n_factors, n_users_l, n_items_l,
-                      margin=0.5, lambda_variance=10.0, lambda_bias=1, max_norm=1.0, warp_count=20, lambda_cov=100)
-    train_and_save(model)
-    model = KBPRModel(n_factors, n_users_l, n_items_l,
-                      margin=0.5, lambda_variance=100.0, lambda_bias=0.1, max_norm=1.0, warp_count=20, lambda_cov=10)
+    model = BPRModel(n_factors, n_users_l, n_items_l,
+                     lambda_u=1, lambda_v=1, lambda_b=0.1,
+                     margin=1.0, learning_rate=.01,
+                     batch_size=200000, loss_f="sigmoid", warp_count=1)
     train_and_save(model)
 
 # ## LightFM Features

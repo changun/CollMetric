@@ -2,11 +2,11 @@ from model import *
 from utils import *
 import theano.misc.pkl_utils
 
-# create datasets
-# user_dict_l, features_l, labels, to_title = medium()
+#create datasets
+# user_dict_l, features_l, topics, labels, to_title = medium()
 # n_items_l, n_users_l, train_dict_l, valid_dict_l, test_dict_l, exclude_dict_l, cold_dict_l, popular_l, cold_l = preprocess(
-#     user_dict_l, [3, 1, 1])
-
+#      user_dict_l, [3, 1, 1])
+# features_l = topics
 # from pymongo import MongoClient
 # import gridfs
 #
@@ -14,8 +14,10 @@ import theano.misc.pkl_utils
 # fs = gridfs.GridFS(db)
 # import io, cPickle
 # with io.BytesIO() as byte:
-#     cPickle.dump(features_l, byte)
-#     fs.put(byte.getvalue(), _id=hash(byte.getvalue()), dataset="Medium")
+#      theano.misc.pkl_utils.dump(features_l, byte)
+#      fs.put(byte.getvalue(), _id=hash(byte.getvalue()), dataset="Medium", with_topics=True)
+#      print hash(byte.getvalue())
+#
 def load_data():
     from pymongo import MongoClient
     import gridfs, cPickle
@@ -24,46 +26,68 @@ def load_data():
     model, train_dict_l, valid_dict_l, test_dict_l, exclude_dict_l = load_model(-6847242372680792284)
     n_users_l = model.n_users
     n_items_l = model.n_items
-    cold_dict_l = None
-    popular_l = None
-    cold_l = None
-    features_f = cPickle.load(fs.get(db.fs.files.find_one({"dataset": "Medium"})["_id"]))
+    cold_dict_l = {}
+    popular_l = {}
+    cold_l = {}
+    features_f = theano.misc.pkl_utils.load(fs.get(2426373644027780065))
     return model, n_users_l, n_items_l, train_dict_l, valid_dict_l, test_dict_l, exclude_dict_l, cold_dict_l, \
            popular_l,  cold_l, features_f
 
 model, n_users_l, n_items_l, train_dict_l, valid_dict_l, test_dict_l, exclude_dict_l, cold_dict_l, \
 popular_l,  cold_l, features_l  = load_data()
-import scipy.sparse
-features_l = scipy.sparse.csc_matrix(features_l, dtype="float32")
+
+# import scipy.sparse
+# features_l = scipy.sparse.csc_matrix(features_l, dtype="float32")
 
 def train_and_save(model):
     model = early_stop(model, train_dict_l, lambda m: -m.recall(valid_dict_l, train_dict_l, n_users=3000)[0][0],
-                      patience=500, validation_frequency=100, n_epochs=10000000, adagrad=True)
+                      patience=500, validation_frequency=100, n_epochs=10000000, adagrad=True, dynamic=True)
     save("Medium", model, n_users_l, n_items_l, train_dict_l, valid_dict_l, test_dict_l, exclude_dict_l, cold_dict_l,
-         popular_l,  cold_l)
+         popular_l,  cold_l, with_topics=True)
 
 
 
-# for n_factors in (100, 10, 40, 70):
-#     model = VisualOffsetBPR(n_factors, n_users_l, n_items_l, features_l,
-#                             lambda_u=0.1, lambda_v=0.1, lambda_bias=0.1,
-#                             lambda_weight_l1=0, lambda_weight_l2=0.0, dropout_rate=0.5, n_layers=2, width=256,
-#                             lambda_v_off=1, margin=1.0, learning_rate=.05,
-#                             embedding_rescale=0.1, batch_size=200000)
-#     train_and_save(model)
+for n_factors in (100, 10, 40, 70):
+    model = VisualOffsetBPR(n_factors, n_users_l, n_items_l, features_l,
+                            lambda_u=0.01, lambda_v=0.01, lambda_bias=0.1,
+                            lambda_weight_l1=0, lambda_weight_l2=0.0, dropout_rate=0.5, n_layers=2, width=256,
+                            lambda_v_off=1, margin=1.0, learning_rate=.05,
+                            embedding_rescale=0.1, batch_size=200000)
+    train_and_save(model)
+    model = VisualOffsetBPR(n_factors, n_users_l, n_items_l, features_l,
+                            lambda_u=1, lambda_v=1, lambda_bias=0.1,
+                            lambda_weight_l1=0, lambda_weight_l2=0.0, dropout_rate=0.5, n_layers=2, width=256,
+                            lambda_v_off=1, margin=1.0, learning_rate=.05,
+                            embedding_rescale=0.1, batch_size=200000)
+    train_and_save(model)
 
-name = "Medium_VKBPR_N_Factors.p"
-for n_factors in (100,):
+# name = "Medium_VKBPR_N_Factors.p"
+model = VisualFactorKBPR(100, n_users_l, n_items_l, features_l,
+                         lambda_weight_l1=0, lambda_weight_l2=0.0, dropout_rate=1, n_layers=3, width=256,
+                         lambda_v_off=.5, lambda_bias=10, lambda_variance=10.0, lambda_cov=0,
+                         embedding_rescale=0.1, warp_count=20, batch_size=200000, learning_rate=0.1, margin=0.5)
+train_and_save(model)
+model = VisualFactorKBPR(100, n_users_l, n_items_l, features_l,
+                         lambda_weight_l1=0, lambda_weight_l2=0.0, dropout_rate=1, n_layers=3, width=256,
+                         lambda_v_off=.5, lambda_bias=10, lambda_variance=1.0, lambda_cov=0,
+                         embedding_rescale=0.1, warp_count=20, batch_size=200000, learning_rate=0.1, margin=0.5)
+train_and_save(model)
+model = VisualFactorKBPR(100, n_users_l, n_items_l, features_l,
+                         lambda_weight_l1=0, lambda_weight_l2=0.0, dropout_rate=0.5, n_layers=3, width=256,
+                         lambda_v_off=.5, lambda_bias=10, lambda_variance=10.0, lambda_cov=0,
+                         embedding_rescale=0.1, warp_count=20, batch_size=200000, learning_rate=0.1, margin=0.5)
+train_and_save(model)
+for n_factors in (100, 10, 40, 70):
     features_l = features_l
     model = VisualFactorKBPR(n_factors, n_users_l, n_items_l, features_l,
                              lambda_weight_l1=0, lambda_weight_l2=0.0, dropout_rate=.5, n_layers=2, width=256,
                              lambda_v_off=1.0, lambda_bias=10, lambda_variance=100.0, lambda_cov=10,
-                             embedding_rescale=0.1, warp_count=20, batch_size=100000, learning_rate=0.05, margin=0.5)
+                             embedding_rescale=0.1, warp_count=20, batch_size=200000, learning_rate=0.05, margin=0.5)
     train_and_save(model)
     model = VisualFactorKBPR(n_factors, n_users_l, n_items_l, features_l,
                              lambda_weight_l1=0, lambda_weight_l2=0.0, dropout_rate=.5, n_layers=2, width=256,
                              lambda_v_off=1.5, lambda_bias=10, margin=0.5,
-                             embedding_rescale=0.1, warp_count=20, batch_size=100000, learning_rate=0.05, lambda_cov=10)
+                             embedding_rescale=0.04, warp_count=20, batch_size=200000, learning_rate=0.05, lambda_cov=10)
     train_and_save(model)
 # for n in [100, 70, 40, 10]:
 #     model = KBPRModel(n, n_users_l, n_items_l, margin=0.5, lambda_variance=100,
