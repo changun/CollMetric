@@ -342,13 +342,14 @@ class UserKNN(Model):
         self.active_users_matrix = self.matrix[self.active_users, :]
 
     def scores_for_users(self, users):
-        if self.metric == "cosine":
-            sim_per_users = cosine_similarity(self.matrix[users, :], self.active_users_matrix)
-        else:
-            sim_per_users = 1 - pairwise_distances(self.matrix[users, :], self.active_users_matrix, metric=self.metric)
-        for sim in sim_per_users:
-            knn = numpy.argpartition(-sim, self.K)[0:self.K]
-            yield (sim[knn] * self.active_users_matrix[knn])
+        for users in numpy.array_split(numpy.asarray(users, dtype="int32"),max(1, len(users) // 100)):
+            if self.metric == "cosine":
+                sim_per_users = cosine_similarity(self.matrix[users, :], self.active_users_matrix)
+            else:
+                sim_per_users = 1 - pairwise_distances(self.matrix[users, :], self.active_users_matrix, metric=self.metric)
+            for sim in sim_per_users:
+                knn = numpy.argpartition(-sim, self.K)[0:self.K]
+                yield (sim[knn] * self.active_users_matrix[knn])
 
     def params(self):
         return super(UserKNN, self).params() + [["K", self.K]]
