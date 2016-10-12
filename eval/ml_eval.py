@@ -2,26 +2,30 @@ from model import *
 from utils import *
 import theano.misc.pkl_utils
 
-# create datasets
-# user_dict_l, features_l, labels, to_title = movielens20M(min_rating=0.0, user_rating_count=10, tag_freq_thres=20, use_director=False)
-# n_items_l, n_users_l, train_dict_l, valid_dict_l, test_dict_l, exclude_dict_l, cold_dict_l, popular_l, cold_l = preprocess(
-#     user_dict_l, [3, 1, 1])
-#
-# files = ["MovieLens0_LightFM_N_Factors.p",
-#          "MovieLens0_KBPR_N_Factors.p", ]
-#
-# save_batch(files, "MovieLens", n_users_l, n_items_l, train_dict_l, valid_dict_l, test_dict_l, exclude_dict_l, cold_dict_l, popular_l, cold_l,
-#            subject_thres=5, min_rating=0.0, user_rating_count=10, tag_freq_thres=20, use_director=False)
 
 user_dict_l, features_l, labels, to_title = movielens20M(min_rating=4.0, user_rating_count=10, tag_freq_thres=20, use_director=False)
 n_items_l, n_users_l, train_dict_l, valid_dict_l, test_dict_l, exclude_dict_l, cold_dict_l, popular_l, cold_l = preprocess(
-    user_dict_l, [3, 1, 1])
+     user_dict_l, [3, 1, 1])
 
-# files4 = ["MovieLens4_KBPR_N_Factors.p",
-#          "MovieLens4_VKBPR_N_Factors.p"]
-#
-# save_batch(files4, "MovieLens", n_users_l, n_items_l, train_dict_l, valid_dict_l, test_dict_l, exclude_dict_l, cold_dict_l, popular_l, cold_l,
-#            subject_thres=5, min_rating=4.0, user_rating_count=10, tag_freq_thres=20, use_director=False)
+
+def load_data():
+    from pymongo import MongoClient
+    import gridfs, cPickle
+    db = MongoClient().features
+    fs = gridfs.GridFS(db)
+    model, train_dict_l, valid_dict_l, test_dict_l, exclude_dict_l = load_model(-1438456719658488636)
+    n_users_l = model.n_users
+    n_items_l = model.n_items
+    cold_dict_l = None
+    popular_l = None
+    cold_l = None
+    features_f = cPickle.load(fs.get(db.fs.files.find_one({"dataset": "MovieLens"})["_id"]))
+    return model, n_users_l, n_items_l, train_dict_l, valid_dict_l, test_dict_l, exclude_dict_l, cold_dict_l, \
+           popular_l,  cold_l, features_f
+
+model, n_users_l, n_items_l, train_dict_l, valid_dict_l, test_dict_l, exclude_dict_l, cold_dict_l, \
+popular_l,  cold_l, features_f  = load_data()
+
 
 def train_and_save(model):
     model = early_stop(model, train_dict_l, lambda m: -m.recall(valid_dict_l, train_dict_l, n_users=3000)[0][0],

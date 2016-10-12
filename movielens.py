@@ -38,13 +38,13 @@ def import_imdb():
 
                 movie = i.get_movie(m.movieID)
                 movie["keywords"] = i.get_movie_keywords(m.movieID)["data"]
-                movie["votes_details"] = i.get_movie_vote_details(imdb_id)["data"]
-                movie["critic_reviews"] = i.get_movie_critic_reviews(imdb_id)["data"]
-                movie["awards"] = i.get_movie_awards(imdb_id)["data"]
+                #movie["votes_details"] = i.get_movie_vote_details(imdb_id)["data"]
+                #movie["critic_reviews"] = i.get_movie_critic_reviews(imdb_id)["data"]
+                #movie["awards"] = i.get_movie_awards(imdb_id)["data"]
                 movie["business"] = i.get_movie_business(imdb_id)["data"]
-                movie["recommendations"] = i.get_movie_recommendations(imdb_id)["data"]
+                #movie["recommendations"] = i.get_movie_recommendations(imdb_id)["data"]
                 movie["synopsis"] = i.get_movie_synopsis(imdb_id)["data"]
-                movie["news"] = i.get_movie_news(imdb_id)
+                #movie["news"] = i.get_movie_news(imdb_id)
                 
                 netflix_imdb[netflix_id] = imdb_id
                 fp = gzip.open('/data/imdb/' + imdb_id + ".p", 'wb')
@@ -55,6 +55,48 @@ def import_imdb():
                 print title
 
     cPickle.dump(netflix_imdb, open("Neflix_IMDB.p", "wb"))
+
+
+def import_imdb():
+    i = IMDb()
+    netflix_imdb = cPickle.load(open("Neflix_IMDB.p"))
+    no_year = neflix_title(with_year=False)
+    for id, title in neflix_title().items():
+        netflix_id = id + 1
+        if netflix_id not in netflix_imdb:
+            try:
+                ms = i.search_movie(title)
+                if len(ms) > 0:
+                    m = ms[0]
+                else:
+                    ms = i.search_movie(no_year[id])
+                    if len(ms) > 0:
+                        m = ms[0]
+                    else:
+                        short_name = re.split("[:\(/]+|(Season \d)|(Trilogy)", no_year[id])[0]
+                        print "%s -> %s" % (no_year[id], short_name)
+                        m = i.search_movie(short_name)[0]
+
+                imdb_id = m.movieID
+
+                movie = i.get_movie(m.movieID)
+                movie["keywords"] = i.get_movie_keywords(m.movieID)["data"]
+                # movie["votes_details"] = i.get_movie_vote_details(imdb_id)["data"]
+                # movie["critic_reviews"] = i.get_movie_critic_reviews(imdb_id)["data"]
+                # movie["awards"] = i.get_movie_awards(imdb_id)["data"]
+                movie["business"] = i.get_movie_business(imdb_id)["data"]
+                # movie["recommendations"] = i.get_movie_recommendations(imdb_id)["data"]
+                movie["synopsis"] = i.get_movie_synopsis(imdb_id)["data"]
+                # movie["news"] = i.get_movie_news(imdb_id)
+
+                netflix_imdb[netflix_id] = imdb_id
+                fp = gzip.open('/data/imdb/' + imdb_id + ".p", 'wb')
+                cPickle.dump(movie, fp)
+                fp.close()
+            except Exception as e:
+                print e
+                print title
+
 
 def import_imdb_more():
     i = IMDb()

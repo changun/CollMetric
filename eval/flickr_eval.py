@@ -33,15 +33,9 @@ def train_and_save(model):
 
 for n_factors in (100, 10, 40, 70):
     model = VisualOffsetBPR(n_factors, n_users_l, n_items_l, features_f,
-                            lambda_u=0.01, lambda_v=0.01, lambda_bias=0.1,
+                            lambda_u=0.1, lambda_v=0.1, lambda_bias=0.1,
                             lambda_weight_l1=0, lambda_weight_l2=0.0, dropout_rate=0.5, n_layers=2, width=256,
                             lambda_v_off=1, margin=1.0, learning_rate=.05,
-                            embedding_rescale=0.1, batch_size=200000)
-    train_and_save(model)
-    model = VisualOffsetBPR(n_factors, n_users_l, n_items_l, features_f,
-                            lambda_u=0.01, lambda_v=0.01, lambda_bias=0.1,
-                            lambda_weight_l1=0, lambda_weight_l2=0.0, dropout_rate=0.5, n_layers=2, width=256,
-                            lambda_v_off=0.1, margin=1.0, learning_rate=.05,
                             embedding_rescale=0.1, batch_size=200000)
     train_and_save(model)
 
@@ -105,15 +99,25 @@ for n_factors in (100, 10, 40, 70):
 # #         save("kbpr", new_model, name)
 #
 # #
-# name = "Flickr_VKBPR_N_Factors.p"
-# for n_factors in (10, 40, 70, 100):
-#     model = VisualFactorKBPR(n_factors, n_users_f, n_items_f, features_f,
-#                              lambda_weight_l1=0, lambda_weight_l2=0.0, dropout_rate=.5, n_layers=2, width=256,
-#                              lambda_v_off=1, margin=0.5,
-#                              embedding_rescale=0.1, lambda_cov=10)
-#
-#     model = train_fn(model)
-#     save("vkbpr", model, name)
+name = "Flickr_VKBPR_N_Factors.p"
+for n_factors in (100,):
+    model = VisualFactorKBPR(n_factors, n_users_l, n_items_l, features_f,
+                             lambda_weight_l1=0, lambda_weight_l2=0.0, dropout_rate=.5, n_layers=2, width=256,
+                             lambda_v_off=1, margin=0.5,
+                             embedding_rescale=0.1, lambda_cov=100, warp_count=20, learning_rate=0.05, lambda_bias=0.1)
+    train_and_save(model)
+    model = VisualFactorKBPR(n_factors, n_users_l, n_items_l, features_f,
+                             lambda_weight_l1=0, lambda_weight_l2=0.0, dropout_rate=.5, n_layers=2, width=256,
+                             lambda_v_off=1, margin=1.0,
+                             embedding_rescale=0.1, lambda_cov=100, warp_count=20, learning_rate=0.05, lambda_bias=0.1)
+    train_and_save(model)
+    model = VisualFactorKBPR(n_factors, n_users_l, n_items_l, features_f,
+                             lambda_weight_l1=0, lambda_weight_l2=0.0, dropout_rate=.5, n_layers=2, width=256,
+                             lambda_v_off=1, margin=0.5,
+                             embedding_rescale=0.1, lambda_cov=100, warp_count=20, learning_rate=0.05, lambda_bias=10)
+    train_and_save(model)
+
+
 #
 #
 # for n_factors in (10, 40, 70, 100):
