@@ -1370,7 +1370,7 @@ def yelp():
     import cPickle
     import numpy
     import sklearn.preprocessing
-
+    import sklearn.feature_extraction.text
     def to_dict(list_of_list, start_i = 0):
         ret = {}
         for i, items in enumerate(list_of_list):
@@ -1386,7 +1386,12 @@ def yelp():
             for i in items:
               max_id = max(max_id, i)
     U_features = numpy.concatenate([numpy.load("../yelp/train_features.npy"), numpy.load("../yelp/val_features.npy")], axis=0)
-    return len(U_features), max_id+1, train, valid, test, U_features
+    U_features_ut = numpy.concatenate([numpy.load("../yelp/train_features_ut.npy"), numpy.load("../yelp/val_features_ut.npy")],
+                                   axis=0)
+    idf = sklearn.feature_extraction.text.TfidfTransformer()
+    idf.fit(numpy.load("../yelp/train_features_ut.npy"))
+    U_features_ut_idf = idf.fit_transform(U_features_ut)
+    return len(U_features), max_id+1, train, valid, test, U_features, U_features_ut, U_features_ut_idf
 
 def lsh(dataset, distance='euclidean_squared', lsh_family="cross_polytope", n_hash_bits=18, n_rotations=1, n_tables=50):
     # or negative_inner_product
@@ -1588,6 +1593,39 @@ def load_model(id):
     model = theano.misc.pkl_utils.load(fs.get(id))
     train, valid, test, exclude = load_dataset(model_record["dataset_id"])
     return model, train, valid, test, exclude
+
+def eval_one_100000(id):
+    from pymongo import MongoClient
+    model, train, valid, test, exclude = load_model(id)
+    db = MongoClient().models
+    model_record = db["fs.files"].find_one(id)
+    print "Eval " + model_record["name"]
+    [[valid_recall_100, valid_recall_100_sem],
+     [valid_recall_50, valid_recall_50_sem],
+     [valid_recall_10, valid_recall_10_sem]
+     ] = model.recall(valid, train, n_users=100000)
+    model_record["valid_recall_100"] = valid_recall_100
+    model_record["valid_recall_50"] = valid_recall_50
+    model_record["valid_recall_10"] = valid_recall_10
+    model_record["valid_recall_100_sem"] = valid_recall_100_sem
+    model_record["valid_recall_50_sem"] = valid_recall_50_sem
+    model_record["valid_recall_10_sem"] = valid_recall_10_sem
+
+    [[test_recall_100, test_recall_100_sem],
+     [test_recall_50, test_recall_50_sem],
+     [test_recall_10, test_recall_10_sem]
+     ] = model.recall(test, merge_dict(merge_dict(train, valid), exclude), n_users=100000)
+    model_record["test_recall_100"] = test_recall_100
+    model_record["test_recall_50"] = test_recall_50
+    model_record["test_recall_10"] = test_recall_10
+    model_record["test_recall_100_sem"] = test_recall_100_sem
+    model_record["test_recall_50_sem"] = test_recall_50_sem
+    model_record["test_recall_10_sem"] = test_recall_10_sem
+
+    db["fs.files"].save(model_record)
+    print "Save " + model_record["name"]
+
+
 def eval_one(id):
     from pymongo import MongoClient
     model, train, valid, test, exclude = load_model(id)
