@@ -1900,5 +1900,6 @@ class VisualBPR(BPRModel):
         ret = super(VisualBPR, self).__getstate__()
         # remove V_feature from the serialization
         ret["V_features"] = None
-        ret["V_embedding"] = theano.function([], self.V_embedding)()
+        if not isinstance(self.V_embedding, numpy.ndarray):
+            ret["V_embedding"] = theano.function([], self.V_embedding)()
         return ret
