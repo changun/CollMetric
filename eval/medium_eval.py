@@ -41,9 +41,35 @@ popular_l,  cold_l, features_l  = load_data()
 
 def train_and_save(model):
     model = early_stop(model, train_dict_l, lambda m: -m.recall(valid_dict_l, train_dict_l, n_users=3000)[0][0],
-                      patience=500, validation_frequency=100, n_epochs=10000000, adagrad=True, dynamic=True)
+                      patience=500, validation_frequency=100, n_epochs=10000000, adagrad=True, )
     save("Medium", model, n_users_l, n_items_l, train_dict_l, valid_dict_l, test_dict_l, exclude_dict_l, cold_dict_l,
          popular_l,  cold_l, with_topics=True)
+
+
+for n_factors in (100, 10, 40, 70):
+    n_factors = n_factors / 2
+    model = VisualBPR(n_factors, n_users_l, n_items_l, features_l,
+                            lambda_u=0.1, lambda_v=0.1, lambda_bias=1,
+                            lambda_weight_l1=0, lambda_weight_l2=0.0, dropout_rate=0.5, n_layers=2, width=256,
+                            margin=1.0, learning_rate=.05,
+                            embedding_rescale=0.1, batch_size=200000)
+
+    train_and_save(model)
+    model = VisualBPR(n_factors, n_users_l, n_items_l, features_l,
+                            lambda_u=0.1, lambda_v=1.0, lambda_bias=0.1,
+                            lambda_weight_l1=0, lambda_weight_l2=0.0, dropout_rate=0.5, n_layers=2, width=256,
+                             margin=1.0, learning_rate=.05,
+                            embedding_rescale=0.1, batch_size=200000)
+
+    train_and_save(model)
+    model = VisualBPR(n_factors, n_users_l, n_items_l, features_l,
+                            lambda_u=1, lambda_v=1, lambda_bias=0.1,
+                            lambda_weight_l1=0, lambda_weight_l2=0.0, dropout_rate=0.5, n_layers=2, width=256,
+                             margin=1.0, learning_rate=.05,
+                            embedding_rescale=0.1, batch_size=200000)
+
+    train_and_save(model)
+
 
 
 
@@ -64,17 +90,19 @@ for n_factors in (100, 10, 40, 70):
 # name = "Medium_VKBPR_N_Factors.p"
 model = VisualFactorKBPR(100, n_users_l, n_items_l, features_l,
                          lambda_weight_l1=0, lambda_weight_l2=0.0, dropout_rate=1, n_layers=3, width=256,
-                         lambda_v_off=.5, lambda_bias=10, lambda_variance=10.0, lambda_cov=0,
+                         lambda_v_off=1.0, lambda_bias=10, lambda_variance=10.0, lambda_cov=100,
                          embedding_rescale=0.1, warp_count=20, batch_size=200000, learning_rate=0.1, margin=0.5)
 train_and_save(model)
+
 model = VisualFactorKBPR(100, n_users_l, n_items_l, features_l,
                          lambda_weight_l1=0, lambda_weight_l2=0.0, dropout_rate=1, n_layers=3, width=256,
-                         lambda_v_off=.5, lambda_bias=10, lambda_variance=1.0, lambda_cov=0,
+                         lambda_v_off=1.0, lambda_bias=10, lambda_variance=5.0, lambda_cov=100,
                          embedding_rescale=0.1, warp_count=20, batch_size=200000, learning_rate=0.1, margin=0.5)
 train_and_save(model)
+
 model = VisualFactorKBPR(100, n_users_l, n_items_l, features_l,
-                         lambda_weight_l1=0, lambda_weight_l2=0.0, dropout_rate=0.5, n_layers=3, width=256,
-                         lambda_v_off=.5, lambda_bias=10, lambda_variance=10.0, lambda_cov=0,
+                         lambda_weight_l1=0, lambda_weight_l2=0.0, dropout_rate=1, n_layers=3, width=256,
+                         lambda_v_off=1.0, lambda_bias=10, lambda_variance=10.0, lambda_cov=10,
                          embedding_rescale=0.1, warp_count=20, batch_size=200000, learning_rate=0.1, margin=0.5)
 train_and_save(model)
 for n_factors in (100, 10, 40, 70):

@@ -30,29 +30,53 @@ def train_and_save(model):
                       patience=500, validation_frequency=100, n_epochs=10000000, adagrad=True)
     save("Flickr", model, n_users_l, n_items_l, train_dict_l, valid_dict_l, test_dict_l, exclude_dict_l, cold_dict_l,
          popular_l,  cold_l)
-#
 for n_factors in (100, 10, 40, 70):
-    model = VisualOffsetBPR(n_factors, n_users_l, n_items_l, features_f,
+
+    model = VisualBPR(n_factors, n_users_l, n_items_l, features_f,
                             lambda_u=0.1, lambda_v=0.1, lambda_bias=1,
                             lambda_weight_l1=0, lambda_weight_l2=0.0, dropout_rate=0.5, n_layers=2, width=256,
-                            lambda_v_off=1, margin=1.0, learning_rate=.05,
+                             margin=1.0, learning_rate=.05,
                             embedding_rescale=0.1, batch_size=200000)
 
     train_and_save(model)
-    model = VisualOffsetBPR(n_factors, n_users_l, n_items_l, features_f,
+    model = VisualBPR(n_factors, n_users_l, n_items_l, features_f,
                             lambda_u=0.1, lambda_v=1.0, lambda_bias=0.1,
                             lambda_weight_l1=0, lambda_weight_l2=0.0, dropout_rate=0.5, n_layers=2, width=256,
-                            lambda_v_off=1, margin=1.0, learning_rate=.05,
+                             margin=1.0, learning_rate=.05,
                             embedding_rescale=0.1, batch_size=200000)
 
     train_and_save(model)
-    model = VisualOffsetBPR(n_factors, n_users_l, n_items_l, features_f,
+    model = VisualBPR(n_factors, n_users_l, n_items_l, features_f,
                             lambda_u=1, lambda_v=1, lambda_bias=0.1,
                             lambda_weight_l1=0, lambda_weight_l2=0.0, dropout_rate=0.5, n_layers=2, width=256,
-                            lambda_v_off=1, margin=1.0, learning_rate=.05,
+                            margin=1.0, learning_rate=.05,
                             embedding_rescale=0.1, batch_size=200000)
 
     train_and_save(model)
+
+#
+# for n_factors in (100, 10, 40, 70):
+#     model = VisualOffsetBPR(n_factors, n_users_l, n_items_l, features_f,
+#                             lambda_u=0.1, lambda_v=0.1, lambda_bias=1,
+#                             lambda_weight_l1=0, lambda_weight_l2=0.0, dropout_rate=0.5, n_layers=2, width=256,
+#                             lambda_v_off=1, margin=1.0, learning_rate=.05,
+#                             embedding_rescale=0.1, batch_size=200000)
+#
+#     train_and_save(model)
+#     model = VisualOffsetBPR(n_factors, n_users_l, n_items_l, features_f,
+#                             lambda_u=0.1, lambda_v=1.0, lambda_bias=0.1,
+#                             lambda_weight_l1=0, lambda_weight_l2=0.0, dropout_rate=0.5, n_layers=2, width=256,
+#                             lambda_v_off=1, margin=1.0, learning_rate=.05,
+#                             embedding_rescale=0.1, batch_size=200000)
+#
+#     train_and_save(model)
+#     model = VisualOffsetBPR(n_factors, n_users_l, n_items_l, features_f,
+#                             lambda_u=1, lambda_v=1, lambda_bias=0.1,
+#                             lambda_weight_l1=0, lambda_weight_l2=0.0, dropout_rate=0.5, n_layers=2, width=256,
+#                             lambda_v_off=1, margin=1.0, learning_rate=.05,
+#                             embedding_rescale=0.1, batch_size=200000)
+#
+#     train_and_save(model)
 
 for n_factors in (100, 10, 40, 70):
     model = BPRModel(n_factors, n_users_l, n_items_l,

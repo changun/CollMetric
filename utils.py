@@ -1550,7 +1550,8 @@ def save(dataset, model, n_users, n_items, train_dict, valid_dict, test_dict, ex
                 theano.misc.pkl_utils.dump(model, bytesBuffer)
                 out.write(bytesBuffer.getvalue())
         # evalute the model
-        eval_one(attr["_id"])
+        if dataset != "EchoNest":
+            eval_one(attr["_id"])
 
 def save_batch(filenames, dataset, n_users, n_items, train_dict, valid_dict, test_dict, exclude_dict, cold_dict, popular, cold, **kargs):
     import theano.misc.pkl_utils, os

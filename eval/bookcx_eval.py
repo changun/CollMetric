@@ -16,23 +16,23 @@ def train_and_save(model):
          popular_l,  cold_l, subject_thres=5)
 
 
-## BPR
-for n_factors in (100, 10, 40, 70):
-    model = BPRModel(n_factors, n_users_l, n_items_l,
-                            lambda_u=0.01, lambda_v=0.01, lambda_b=0.1,
-                             margin=1.0, learning_rate=.01,
-                             batch_size=200000, loss_f="sigmoid", warp_count=1)
-    train_and_save(model)
-    model = BPRModel(n_factors, n_users_l, n_items_l,
-                     lambda_u=0.1, lambda_v=0.1, lambda_b=1,
-                     margin=1.0, learning_rate=.01,
-                     batch_size=200000, loss_f="sigmoid", warp_count=1)
-    train_and_save(model)
-    model = BPRModel(n_factors, n_users_l, n_items_l,
-                     lambda_u=1, lambda_v=1, lambda_b=1,
-                     margin=1.0, learning_rate=.01,
-                     batch_size=200000, loss_f="sigmoid", warp_count=1)
-    train_and_save(model)
+# ## BPR
+# for n_factors in (100, 10, 40, 70):
+#     model = BPRModel(n_factors, n_users_l, n_items_l,
+#                             lambda_u=0.01, lambda_v=0.01, lambda_b=0.1,
+#                              margin=1.0, learning_rate=.01,
+#                              batch_size=200000, loss_f="sigmoid", warp_count=1)
+#     train_and_save(model)
+#     model = BPRModel(n_factors, n_users_l, n_items_l,
+#                      lambda_u=0.1, lambda_v=0.1, lambda_b=1,
+#                      margin=1.0, learning_rate=.01,
+#                      batch_size=200000, loss_f="sigmoid", warp_count=1)
+#     train_and_save(model)
+#     model = BPRModel(n_factors, n_users_l, n_items_l,
+#                      lambda_u=1, lambda_v=1, lambda_b=1,
+#                      margin=1.0, learning_rate=.01,
+#                      batch_size=200000, loss_f="sigmoid", warp_count=1)
+#     train_and_save(model)
 
 #
 # # ## LightFM
@@ -63,25 +63,26 @@ for n_factors in (100, 10, 40, 70):
 #                       lambda_bias=10, max_norm=1.0, warp_count=20, lambda_cov=1, batch_size=200000, learning_rate=0.05)
 #     train_and_save(model)
 #
-for n_factors in (10, 40, 70):
-    model = VisualOffsetBPR(n_factors, n_users_l, n_items_l, features_l,
+for n_factors in (100, 10, 40, 70):
+    n_factors = n_factors / 2
+    model = VisualBPR(n_factors, n_users_l, n_items_l, features_l,
                             lambda_u=0.1, lambda_v=0.1, lambda_bias=1,
                             lambda_weight_l1=0, lambda_weight_l2=0.0, dropout_rate=0.5, n_layers=2, width=256,
-                            lambda_v_off=1, margin=1.0, learning_rate=.05,
+                            margin=1.0, learning_rate=.05,
                             embedding_rescale=0.1, batch_size=200000)
 
     train_and_save(model)
-    model = VisualOffsetBPR(n_factors, n_users_l, n_items_l, features_l,
+    model = VisualBPR(n_factors, n_users_l, n_items_l, features_l,
                             lambda_u=0.1, lambda_v=1.0, lambda_bias=0.1,
                             lambda_weight_l1=0, lambda_weight_l2=0.0, dropout_rate=0.5, n_layers=2, width=256,
-                            lambda_v_off=1, margin=1.0, learning_rate=.05,
+                             margin=1.0, learning_rate=.05,
                             embedding_rescale=0.1, batch_size=200000)
 
     train_and_save(model)
-    model = VisualOffsetBPR(n_factors, n_users_l, n_items_l, features_l,
+    model = VisualBPR(n_factors, n_users_l, n_items_l, features_l,
                             lambda_u=1, lambda_v=1, lambda_bias=0.1,
                             lambda_weight_l1=0, lambda_weight_l2=0.0, dropout_rate=0.5, n_layers=2, width=256,
-                            lambda_v_off=1, margin=1.0, learning_rate=.05,
+                             margin=1.0, learning_rate=.05,
                             embedding_rescale=0.1, batch_size=200000)
 
     train_and_save(model)
