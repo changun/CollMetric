@@ -64,7 +64,7 @@ def train_and_save(model):
 #     train_and_save(model)
 #
 for n_factors in (100, 10, 40, 70):
-    n_factors = n_factors / 2
+
     model = VisualBPR(n_factors, n_users_l, n_items_l, features_l,
                             lambda_u=0.1, lambda_v=0.1, lambda_bias=1,
                             lambda_weight_l1=0, lambda_weight_l2=0.0, dropout_rate=0.5, n_layers=2, width=256,

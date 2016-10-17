@@ -634,7 +634,27 @@ def movielens10M(min_rating=0.0, tag_freq_thres=20):
     return user_dict, features, labels
 
 
-def movielens20M(min_rating=3.0, user_rating_count=50, tag_freq_thres=20, use_director=False):
+def movielens20M_features():
+    from zipfile import ZipFile
+    import imdb
+    import csv
+    imdb = imdb.IMDb("sql", uri="postgresql://imdb:imdb@localhost/imdb")
+    id_to_info = {}
+    with ZipFile(open("/data/dataset/ml-20m.zip")) as f:
+        ls = csv.reader(f.open("ml-20m/movies.csv"), delimiter=',', quotechar='"')
+        ls.next()
+
+        for raw_item_id, title, genere in ls:
+            ms = imdb.search_movie(title)
+            if len(ms) == 0:
+                print raw_item_id, title
+            else:
+                id_to_info[int(raw_item_id)] = imdb.get_movie_main(ms[0].getID())
+                print title, id_to_info[int(raw_item_id)]["data"]["title"]
+    return id_to_info
+
+
+def movielens20M(min_rating=3.0, user_rating_count=50, tag_freq_thres=20, use_director=False, infoset=None):
     import sklearn.preprocessing
     from zipfile import ZipFile
     from scipy.sparse import csc_matrix
@@ -683,29 +703,33 @@ def movielens20M(min_rating=3.0, user_rating_count=50, tag_freq_thres=20, use_di
         coll = pymongo.MongoClient().movielens.imdb
         ls = csv.reader(f.open("ml-20m/movies.csv"), delimiter=',', quotechar='"')
         ls.next()
+        import  theano.misc.pkl_utils
+        if infoset == None:
+            infoset = theano.misc.pkl_utils.load(open("/data/dataset/MovieLens20MInfo.p", "rb"))
         for item, name, genre in ls:
             if int(item) in item_ids:
                 item_id = item_ids[int(item)]
-                imdb_record = coll.find_one(int(item), ["year", "keywords", "director.personID", "title"])
-                keywords = []
-                if imdb_record is not None and "keywords" in imdb_record["keywords"]["data"]:
-                    keywords = imdb_record["keywords"]["data"]["keywords"]
-                    if "director" in imdb_record:
-                        director_dict[item_id] = [d["personID"] for d in imdb_record["director"]]
                 year_re = re.search('\((\d+)\)', name)
                 if year_re is not None:
                     year = int(year_re.group(1))
                 else:
                     year = 1984
 
-                feature_dict[item_id] = [g.lower().strip() for g in genre.split("|")] + keywords + [
+                feature_dict[item_id] = [g.lower().strip() for g in genre.split("|")] + [
                     "year-" + str((year / 5) * 5)]
+                if int(item) in infoset:
+                    info = infoset[int(item)]["data"]
+                    if "genres" in info:
+                        if "keywords" in info:
+                            feature_dict[item_id] += info["keywords"]
+                        if "composer" in info:
+                            feature_dict[item_id] += [str(c) for c in info["composer"]]
+                        if "director" in info:
+                            feature_dict[item_id] += [str(c) for c in info["director"]]
+
+                        feature_dict[item_id] += info["genres"]
 
     features, labels = feature_sets_to_array(feature_dict, tag_freq_thres, len(item_ids))
-    director, director_id = feature_sets_to_array(director_dict, 3, len(item_ids))
-    if use_director:
-        labels += director_id
-        features = numpy.hstack((features, director))
 
     return user_dict, csc_matrix(features), labels, id_to_title
 

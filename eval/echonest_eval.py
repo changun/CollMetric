@@ -62,14 +62,14 @@ import gc
 #     gc.collect()
 
 
-for n_factors in ( 40, 70):
+for n_factors in (100, 70, 40, 10):
     model = BPRModel(n_factors, n_users_l, n_items_l,
-                            lambda_u=0.01, lambda_v=0.01, lambda_b=0.1,
-                             margin=1.0, learning_rate=.01,
-                             batch_size=200000, loss_f="sigmoid", warp_count=1)
+                     lambda_u=10, lambda_v=10, lambda_b=1,
+                     margin=1.0, learning_rate=.01,
+                     batch_size=2000000, loss_f="sigmoid", warp_count=1)
     train_and_save(model)
     model = BPRModel(n_factors, n_users_l, n_items_l,
-                     lambda_u=0.01, lambda_v=0.01, lambda_b=1,
-                     margin=1.0, learning_rate=.01,
-                     batch_size=200000, loss_f="sigmoid", warp_count=1)
+                            lambda_u=1, lambda_v=1, lambda_b=0.1,
+                             margin=1.0, learning_rate=.01,
+                             batch_size=2000000, loss_f="sigmoid", warp_count=1)
     train_and_save(model)

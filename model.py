@@ -3,7 +3,7 @@ import pyprind
 import scipy
 import numpy
 from lightfm import LightFM
-from utils import dict_to_coo
+from utils import dict_to_coo, coo_to_dict
 import theano
 import time, sys
 import theano.tensor as T
@@ -353,6 +353,85 @@ class UserKNN(Model):
 
     def params(self):
         return super(UserKNN, self).params() + [["K", self.K]]
+
+class WRMF(Model):
+    def __init__(self, n_users, n_items, n_factors, a, b, lambda_u, lambda_v):
+        Model.__init__(self, n_users, n_items)
+        self.a = a
+        self.b = b
+        self.lambda_u = lambda_u
+        self.lambda_v = lambda_v
+        self.n_factors = n_factors
+        self.U = theano.shared(
+            value=numpy.random.normal(0, 1 / (n_factors ** 0.5), (n_users, n_factors)).astype(
+                theano.config.floatX) / 5,
+            name='U',
+            borrow=True
+        )
+        self.V = theano.shared(
+            value=numpy.random.normal(0, 1 / (n_factors ** 0.5), (n_items, n_factors)).astype(
+                theano.config.floatX) / 5,
+            name='V',
+            borrow=True
+        )
+
+        def gen_fun(lambda_reg, my_matrix, target_matrix):
+            import theano.tensor.nlinalg
+            selector = T.ivector()
+            my_index = T.lscalar()
+            XX = T.fmatrix()
+            A = T.dot(target_matrix[selector].T, target_matrix[selector]) * (self.a-self.b)
+            A += XX
+            x = target_matrix[selector].sum(0) * self.a + (lambda_reg * my_matrix[my_index])
+
+            new_me = T.dot(theano.tensor.nlinalg.matrix_inverse(A), x)
+            return theano.function([my_index, selector, XX], new_me,
+                                   updates=[[my_matrix, T.set_subtensor(my_matrix[my_index], new_me)]])
+        self.U_fn = gen_fun(lambda_u, self.U, self.V)
+        self.V_fn = gen_fun(lambda_u, self.V, self.U)
+
+        self.V_XX_fn = theano.function([], T.dot(self.V.T, self.V) * self.b + numpy.identity(n_factors, "float32"))
+        self.U_XX_fn = theano.function([], T.dot(self.U.T, self.U) * self.b + numpy.identity(n_factors, "float32"))
+
+        self.scores_fn = None
+
+    def train(self, train_dict, epoch=1, **kwargs):
+        for _ in range(epoch):
+            bar = pyprind.ProgBar(len(train_dict) + self.n_items)
+            XX = self.V_XX_fn()
+            for u, items in train_dict.items():
+                self.U_fn(u, list(items), XX)
+                bar.update()
+            XX = self.U_XX_fn()
+            for i, users in coo_to_dict(dict_to_coo(train_dict, self.n_users, self.n_items).transpose()).items():
+                self.V_fn(i, list(users), XX)
+                bar.update()
+
+    def scores_for_users(self, users):
+        if self.scores_fn is None:
+            users_input = T.lvector()
+            self.scores_fn = theano.function([users_input], T.dot(self.U[users_input], self.V.T))
+        for users in numpy.array_split(numpy.asarray(users, dtype="int32"),max(1, len(users) // 100)):
+            for scores in self.scores_fn(users):
+                yield scores
+
+    def params(self):
+        return super(WRMF, self).params() + \
+               [["n_factors", self.n_factors],
+                ["lambda_u", self.lambda_u],
+                ["lambda_v", self.lambda_v],
+                ["a", self.a],
+                ["b", self.b],
+                ]
+    def __getstate__(self):
+        ret = super(WRMF, self).__getstate__()
+
+        ret["U_fn"] = None
+        ret["V_fn"] = None
+        ret["V_XX_fn"] = None
+        ret["U_XX_fn"] = None
+        ret["scores_fn"] = None
+        return ret
 
 
 class BPRModel(Model):
@@ -868,8 +947,7 @@ class KBPRModel(BPRModel):
         reg = super(KBPRModel, self).l1_reg()
         if self.K > 1:
             reg += [[self.mixture_density / self.mixture_density.sum(0), self.lambda_density]]
-
-        # reg += [[0 - self.scores_ij(self.i, self.j_pos), 0.001]]
+        #reg += [[0-self.scores_ij(self.i, self.j_pos), 1]]
         return reg
 
     def l2_reg(self):

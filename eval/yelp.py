@@ -1,7 +1,7 @@
 from utils import *
 from model import *
 from sklearn.preprocessing import *
-n_users, n_items, _train, _valid, _test, U_features = yelp()
+n_users, n_items, _train, _valid, _test, U_features, U_features_ut, U_features_ut_idf = yelp()
 thres = 3
 user_dict = merge_dict(merge_dict(_train, _valid), _test)
 numpy.random.seed(1)
@@ -29,16 +29,16 @@ def gen_dict(user_dict, test_users, keep_n, train_n, exclude_users = None):
 # parameter selection
 
 results = []
-for train_n in [1, 2, 3]:
+for train_n in [1]:
     train, valid = gen_dict(user_dict, valid_users, keep_n=3, train_n=train_n, exclude_users=test_users)
     train_valid, test = gen_dict(user_dict, test_users, keep_n=3, train_n=train_n)
-    for model_fn in [lambda K, active_users: UserKNN(n_users, n_items, K=K, active_users=list(active_users)),
-                    lambda K, active_users: ProfileKNN(n_users, n_items, U_features, K=K, active_users=list(active_users))
+    for model_fn in [#lambda K, active_users: UserKNN(n_users, n_items, K=K, active_users=list(active_users)),
+                    lambda K, active_users: ProfileKNN(n_users, n_items, U_features_ut, K=K, active_users=list(active_users))
                      ]:
         # parameter selection
         best_recall = 0
         best_K = 0
-        for K in [400, 500]:#
+        for K in [100, 200, 300, 400, 500, 600, 700]:#
             model = model_fn(K, train_users)
             print model
             model.train(train)

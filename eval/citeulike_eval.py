@@ -75,3 +75,19 @@ for n_factors, model_id in ([100, 7058420260225614648], [70,2699180007298258092]
         import gc
         gc.collect()
 
+train_and_save(model)
+for n_factors in (100,):
+    #model = WRMF(n_users_l, n_items_l, n_factors, 1, 0.01, 0, 0)
+    #train_and_save(model)
+    model = WRMF(n_users_l, n_items_l, n_factors, 1, 0.01, 0.01, 0.01)
+    train_and_save(model)
+    model = WRMF(n_users_l, n_items_l, n_factors, 1, 0.01, 0.01, 0.01)
+    train_and_save(model)
+
+    model = WRMF(n_users_l, n_items_l, n_factors, 1, 0.1, 0, 0)
+    train_and_save(model)
+    model = WRMF(n_users_l, n_items_l, n_factors, 1, 0.1, 0.01, 0.01)
+    train_and_save(model)
+    model = WRMF(n_users_l, n_items_l, n_factors, 1, 0.1, 0.01, 0.01)
+    train_and_save(model)
+
