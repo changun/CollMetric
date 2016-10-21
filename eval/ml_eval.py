@@ -120,3 +120,23 @@ for n_factors in (100, 10, 40, 70):
     model = LightFMModel(n_factors, n_users_l, n_items_l, lambda_u=1E-6, lambda_v=1E-6, loss="bpr")
     train_and_save(model)
 
+
+
+def train_and_save(model):
+    model = early_stop(model, train_dict_l, lambda m: -m.recall(valid_dict_l, train_dict_l, n_users=3000)[0][0],
+                      patience=5, validation_frequency=1, n_epochs=10000000, adagrad=True, dynamic=True)
+    save("MovieLens", model, n_users_l, n_items_l, train_dict_l, valid_dict_l, test_dict_l, exclude_dict_l, cold_dict_l,
+         popular_l,  cold_l, subject_thres=5, min_rating=4.0, user_rating_count=10, tag_freq_thres=20, use_director=False)
+train_and_save(model)
+for n_factors in (100,):
+    model = WRMF(n_users_l, n_items_l, n_factors, 1, 0.01, 0.01, 0.01)
+    train_and_save(model)
+    model = WRMF(n_users_l, n_items_l, n_factors, 1, 0.01, 0.01, 0.01)
+    train_and_save(model)
+
+    model = WRMF(n_users_l, n_items_l, n_factors, 1, 0.1, 0, 0)
+    train_and_save(model)
+    model = WRMF(n_users_l, n_items_l, n_factors, 1, 0.1, 0.01, 0.01)
+    train_and_save(model)
+    model = WRMF(n_users_l, n_items_l, n_factors, 1, 0.1, 0.01, 0.01)
+    train_and_save(model)

@@ -413,11 +413,30 @@ def citeulike(tag_thres=10):
 
     return user_dict, features, labels, None
 
-def echonest(count_thres=5):
+
+def echonest_features():
+    import sqlite3
+    tid_to_sid = {}
+    for line in open("../dataset/unique_tracks.txt"):
+        tid, sid = line.split("<SEP>")[0:2]
+        tid_to_sid[tid.strip()] = sid.strip()
+    # open connection
+    conn = sqlite3.connect("../dataset/lastfm_tags.db")
+    sql = "SELECT tids.tid as tid, tid_tag.tag as tag FROM tid_tag, tids  WHERE tids.ROWID=tid_tag.tid"
+    res = conn.execute(sql)
+    data = res.fetchall()
+    item_to_tags = defaultdict(list)
+    for tid, tag in data:
+        if tid.strip() in tid_to_sid:
+            item_to_tags[tid_to_sid[tid.strip()]].append(tag)
+    return item_to_tags
+
+def echonest(count_thres=5, tag_count=20):
     user_ids = {}
     item_ids = {}
     user_dict = {}
-
+    features = echonest_features()
+    feature_dict = {}
     with open("train_triplets.txt") as f:
         for l in f.readlines():
             fields = l.split("\t")
@@ -431,9 +450,14 @@ def echonest(count_thres=5):
                         user_dict[user_ids[username]] = set()
                     if itemname not in item_ids:
                         item_ids[itemname] = len(item_ids)
+                        feature_dict[item_ids[itemname]] = features[itemname]
                     item_id = item_ids[itemname]
                     user_dict[user_ids[username]].add(item_id)
-    return user_dict
+    features, labels = feature_sets_to_array(feature_dict, tag_count, len(item_ids))
+    return user_dict, features
+
+
+
 
 def lastfm(tag_freq_thres=20, user_thres=50, first_tag_only=False, include_play_count=False):
     import pymongo

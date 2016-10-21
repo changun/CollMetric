@@ -9,11 +9,17 @@ n_items_l, n_users_l, train_dict_l, valid_dict_l, test_dict_l, exclude_dict_l, c
 
 def train_and_save(model):
     model = early_stop(model, train_dict_l, lambda m: -m.recall(valid_dict_l, train_dict_l, n_users=3000)[0][0],
-                      patience=100, validation_frequency=10, n_epochs=10000000, adagrad=True)
+                      patience=500, validation_frequency=100, n_epochs=10000000, adagrad=True)
     save("Citeulike", model, n_users_l, n_items_l, train_dict_l, valid_dict_l, test_dict_l, exclude_dict_l, cold_dict_l,
          popular_l,  cold_l, tag_thres=5)
 
 
+m = KBPRModel(100, n_users_l, n_items_l,
+                         lambda_u=0, lambda_v=0, use_bias=True,  max_norm=1.0, lambda_cov=100,
+
+                         margin=.5, learning_rate=.1,
+                          batch_size=3000, warp_count=20)
+train_and_save(m)
 # ## LightFM
 # name = "Citeulike_LightFM_N_Factors.p"
 # for n_factors in (10, 40, 70, 100,):
@@ -74,6 +80,12 @@ for n_factors, model_id in ([100, 7058420260225614648], [70,2699180007298258092]
         train_and_save(new_model)
         import gc
         gc.collect()
+
+def train_and_save(model):
+    model = early_stop(model, train_dict_l, lambda m: -m.recall(valid_dict_l, train_dict_l, n_users=3000)[0][0],
+                      patience=5, validation_frequency=1, n_epochs=10000000, adagrad=True)
+    save("Citeulike", model, n_users_l, n_items_l, train_dict_l, valid_dict_l, test_dict_l, exclude_dict_l, cold_dict_l,
+         popular_l,  cold_l, tag_thres=5)
 
 train_and_save(model)
 for n_factors in (100,):

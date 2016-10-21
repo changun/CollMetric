@@ -26,13 +26,13 @@ popular_l,  cold_l, features_f  = load_data()
 
 def train_and_save(model):
     model = early_stop(model, train_dict_l, lambda m: -m.recall(valid_dict_l, train_dict_l, n_users=3000)[0][0],
-                      patience=500, validation_frequency=1, n_epochs=10000000, adagrad=True)
+                      patience=500, validation_frequency=100, n_epochs=10000000, adagrad=True)
     save("Flickr", model, n_users_l, n_items_l, train_dict_l, valid_dict_l, test_dict_l, exclude_dict_l, cold_dict_l,
          popular_l,  cold_l)
 
 
-m = KBPRModel(100, n_users_l, n_items_l, features_f,
-                         lambda_u=0, lambda_v=0, lambda_bias=10, lambda_variance=100, max_norm=1.0, lambda_cov=100,
+m = KBPRModel(100, n_users_l, n_items_l,
+                         lambda_u=0, lambda_v=0, use_bias=False,  max_norm=1.0, lambda_cov=100,
 
                          margin=.5, learning_rate=.1,
                           batch_size=100000, warp_count=20)
