@@ -236,7 +236,35 @@ class Model(object):
                 recall[n].append(hits / float(len(likes)))
             bar.update(item_id=str(numpy.mean(recall[max(ns)])))
         return [[numpy.mean(recall[n]), scipy.stats.sem(recall[n])] for n in ns]
+    def recall_with_results(self, likes_dict, exclude_dict, ns=(100, 50, 10), n_users=None, exclude_items=None, users=None):
+        self.before_eval()
+        from collections import defaultdict
+        recall = defaultdict(list)
 
+        if users is None:
+            if n_users is None:
+                users = likes_dict.keys()
+            else:
+                numpy.random.seed(1)
+                users = numpy.random.choice(likes_dict.keys(), replace=False, size=n_users)
+        if exclude_items is not None:
+            exclude_items = set(exclude_items)
+            selected_users = []
+            for user in users:
+                if len(likes_dict[user] - exclude_items) != 0:
+                    selected_users.append(user)
+            users = selected_users
+        bar = pyprind.ProgBar(len(users))
+        for inx, top in enumerate(self.topN(users, exclude_dict, n=max(ns), exclude_items=exclude_items)):
+            user = users[inx]
+            likes = likes_dict[user]
+            top = list(top)
+            for n in ns:
+                hits = itertools.ifilter(lambda item: item in likes, itertools.islice(top, n))
+                hits = reduce(lambda c, _: c + 1, hits, 0)
+                recall[n].append(hits / float(len(likes)))
+            bar.update(item_id=str(numpy.mean(recall[max(ns)])))
+        return recall
     def precision(self, likes_dict, exclude_dict, n=100, n_users=None, exclude_items=None):
         self.before_eval()
         precision = []

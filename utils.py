@@ -160,6 +160,14 @@ def popular_items(train_dict, percentile=90):
     print thres
     return [item for item, count in item_counts.items() if count > thres]
 
+def concenstration(train_dict, percentile=95):
+    item_counts = defaultdict(int)
+    for user, items in train_dict.items():
+        for i in items:
+            item_counts[i] += 1
+    thres = numpy.percentile(item_counts.values(), percentile)
+    return float(sum([count for item, count in item_counts.items() if count > thres])) / sum([count for item, count in item_counts.items() ])
+
 def data_to_dict(data):
     data_dict = defaultdict(set)
     items = set()
@@ -1744,5 +1752,15 @@ def eval_one_for_cold_items(id):
 
 
 
+def t_test(id1, id2):
+    from scipy import stats
+    model1, train, valid, test, exclude = load_model(id1)
+    model2, train, valid, test, exclude = load_model(id2)
+    users = numpy.random.choice(test.keys(), 10000)
+    exclude = merge_dict(valid, exclude)
+    ret1 = model1.recall_with_results(test, exclude, users=users)
+    ret2 = model2.recall_with_results(test, exclude, users=users)
+    for n in ret1.keys():
+        print n, stats.ttest_rel(ret1[n], ret2[n])
 
 
