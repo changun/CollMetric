@@ -59,7 +59,7 @@ class RecallEvaluator(object):
                                  for u in range(n_users) if self.test_user_item_matrix[u, :].sum()}
 
         if self.train_user_item_matrix is not None:
-            self.user_to_train_items = {u: list(self.train_user_item_matrix[u, :].nonzero()[1])
+            self.user_to_train_set = {u: set(self.train_user_item_matrix[u, :].nonzero()[1])
                                         for u in range(n_users) if self.train_user_item_matrix[u, :].sum()}
 
     def eval(self, user_id, item_scores, k=50):
@@ -70,11 +70,21 @@ class RecallEvaluator(object):
         :param k: compute the recall for the top K items
         :return: recall@K
         """
-        if self.train_user_item_matrix is not None:
-            item_scores[self.user_to_train_items[user_id]] = -numpy.Inf
-        top_items = numpy.argpartition(-item_scores, k)[:k]
+        train_set = self.user_to_train_set[user_id]
         test_set = self.user_to_test_set[user_id]
-        return sum([1.0 for i in top_items if i in test_set]) / float(len(test_set))
+
+        top_items = numpy.argpartition(-item_scores, k + len(train_set))[:k + len(train_set)]
+        top_n_items = 0
+        hits = 0
+        for i in top_items:
+            if i in train_set:
+                continue
+            if i in test_set:
+                hits += 1
+            top_n_items += 1
+            if top_n_items == k:
+                break
+        return hits / float(len(test_set))
 
 
 class WarpSampler(object):
@@ -212,7 +222,7 @@ class CML(object):
                 self.feature_projection), 1)
 
             # apply regularization weight
-            return tf.reduce_mean(feature_distance, name="feature_loss") * self.feature_l2_reg
+            return tf.reduce_sum(feature_distance, name="feature_loss") * self.feature_l2_reg
         else:
             return tf.constant(0, dtype=tf.float32)
 
@@ -298,7 +308,7 @@ class CML(object):
 
 
 BATCH_SIZE = 50000
-N_NEGATIVE = 10
+N_NEGATIVE = 20
 EVALUATION_EVERY_N_BATCHES = 100
 EMBED_DIM = 50
 
@@ -347,7 +357,7 @@ def optimize(model, sampler, train, valid):
 
 if __name__ == '__main__':
     # get user-item matrix
-    user_item_matrix, features = citeulike(tag_occurence_thres=10)
+    user_item_matrix, features = citeulike(tag_occurence_thres=5)
     n_users, n_items = user_item_matrix.shape
     # make feature as dense matrix
     dense_features = features.toarray() + 1E-10
@@ -375,7 +385,8 @@ if __name__ == '__main__':
 
     optimize(model, sampler, train, valid)
 
-    # WITH features. In this case, we additionally train a feature projector to project raw item features into the
+    # WITH features
+    # In this case, we additionally train a feature projector to project raw item features into the
     # embedding. The projection serves as "a prior" to inform the item's potential location in the embedding.
     # We use a two fully-connected layers NN as our feature projector. (This model is much more computation intensive.
     # A GPU machine is recommended)
@@ -386,17 +397,15 @@ if __name__ == '__main__':
                 embed_dim=EMBED_DIM,
                 margin=1.0,
                 clip_norm=1.1,
-                master_learning_rate=0.5,
+                master_learning_rate=0.1,
                 # the size of the hidden layer in the feature projector NN
-                hidden_layer_dim=128,
+                hidden_layer_dim=256,
                 # dropout rate between hidden layer and output layer in the feature projector NN
-                dropout_rate=0.3,
+                dropout_rate=0.5,
                 # scale the output of the NN so that the magnitude of the NN output is closer to the item embedding
-                feature_projection_scaling_factor=0.1,
+                feature_projection_scaling_factor=1,
                 # the penalty to the distance between projection and item's actual location in the embedding
                 # tune this to adjust how much the embedding should be biased towards the item features.
                 feature_l2_reg=1,
-
-
                 )
     optimize(model, sampler, train, valid)
