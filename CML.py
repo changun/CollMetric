@@ -344,21 +344,6 @@ if __name__ == '__main__':
     # create warp sampler
     sampler = WarpSampler(train, batch_size=BATCH_SIZE, n_negative=N_NEGATIVE)
 
-
-    # # WITH features
-    # model = CML(n_users,
-    #             n_items,
-    #             features=dense_features,
-    #             embed_dim=EMBED_DIM,
-    #             margin=1.0,
-    #             clip_norm=1.1,
-    #             master_learning_rate=0.5,
-    #             hidden_layer_dim=128,
-    #             feature_l2_reg=1,
-    #             dropout_rate=0.5
-    #             )
-    # optimize(model, sampler, train, valid)
-
     # WITHOUT features
     model = CML(n_users,
                 n_items,
@@ -370,3 +355,18 @@ if __name__ == '__main__':
                 )
 
     optimize(model, sampler, train, valid)
+
+    # WITH features
+    model = CML(n_users,
+                n_items,
+                features=dense_features,
+                embed_dim=EMBED_DIM,
+                margin=1.0,
+                clip_norm=1.1,
+                master_learning_rate=0.5,
+                hidden_layer_dim=128,
+                feature_l2_reg=1,
+                dropout_rate=0.5
+                )
+    optimize(model, sampler, train, valid)
+
