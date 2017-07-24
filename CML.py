@@ -175,6 +175,15 @@ class CML(object):
     def item_embeddings(self):
         return tf.Variable(tf.random_normal([self.n_items, self.embed_dim],
                                             stddev=1 / (self.embed_dim ** 0.5), dtype=tf.float32))
+    @define_scope
+    def mlp_layer_1(self):
+        return tf.layers.dense(inputs=self.features,
+                                    units=self.hidden_layer_dim,
+                                    activation=tf.nn.relu, name="mlp_layer_1")
+    @define_scope
+    def mlp_layer_2(self):
+        dropout = tf.layers.dropout(inputs=self.mlp_layer_1, rate=self.dropout_rate)
+        return tf.layers.dense(inputs=dropout, units=self.embed_dim, name="mlp_layer_2")
 
     @define_scope
     def feature_projection(self):
@@ -184,15 +193,8 @@ class CML(object):
 
         # feature loss
         if self.features is not None:
-            # one fully-connected layer
-            dense = tf.layers.dense(inputs=self.features,
-                                    units=self.hidden_layer_dim,
-                                    activation=tf.nn.relu)
-            # dropout layer
-            dropout = tf.layers.dropout(inputs=dense, rate=self.dropout_rate)
-
-            # scaled output layer
-            output = tf.layers.dense(inputs=dropout, units=self.embed_dim) * self.feature_projection_scaling_factor
+            # fully-connected layer
+            output = self.mlp_layer_2 * self.feature_projection_scaling_factor
 
             # projection to the embedding
             return tf.clip_by_norm(output, self.clip_norm, axes=[1], name="feature_projection")
@@ -207,10 +209,10 @@ class CML(object):
             # the distance between feature projection and the item's actual location in the embedding
             feature_distance = tf.reduce_mean(tf.squared_difference(
                 self.item_embeddings,
-                self.feature_projection) + 1E-10, 1)
+                self.feature_projection), 1)
 
             # apply regularization weight
-            return tf.reduce_sum(feature_distance, name="feature_loss") * self.feature_l2_reg
+            return tf.reduce_mean(feature_distance, name="feature_loss") * self.feature_l2_reg
         else:
             return tf.constant(0, dtype=tf.float32)
 
@@ -272,9 +274,18 @@ class CML(object):
 
     @define_scope
     def optimize(self):
-        gd = tf.train.AdagradOptimizer(self.master_learning_rate).minimize(self.loss)
-        with tf.control_dependencies([gd]):
-            return [gd, self.clip_by_norm_op]
+        # have two separate learning rates. The first one for user/item embedding is un-normalized.
+        # The second one for feature projector NN is normalized by the number of items.
+        gd = tf.train\
+            .AdagradOptimizer(self.master_learning_rate)\
+            .minimize(self.loss, var_list=[self.user_embeddings, self.item_embeddings])
+
+        gd2 = tf.train \
+            .AdagradOptimizer(self.master_learning_rate) \
+            .minimize(self.feature_loss/self.n_items)
+
+        with tf.control_dependencies([gd, gd2]):
+            return [gd, gd2, self.clip_by_norm_op]
 
     @define_scope
     def item_scores(self):
@@ -286,9 +297,9 @@ class CML(object):
         return -tf.reduce_sum(tf.squared_difference(user, item), 2, name="scores")
 
 
-BATCH_SIZE = 10000
+BATCH_SIZE = 50000
 N_NEGATIVE = 10
-EVALUATION_EVERY_N_BATCHES = 10
+EVALUATION_EVERY_N_BATCHES = 100
 EMBED_DIM = 50
 
 
@@ -334,40 +345,58 @@ def optimize(model, sampler, train, valid):
         print("\nTraining loss {}".format(numpy.mean(losses)))
 
 
-
 if __name__ == '__main__':
     # get user-item matrix
     user_item_matrix, features = citeulike(tag_occurence_thres=10)
     n_users, n_items = user_item_matrix.shape
     # make feature as dense matrix
-    dense_features = sklearn.preprocessing.normalize(features.toarray() + 1E-10)
+    dense_features = features.toarray() + 1E-10
     # get train/valid/test user-item matrices
     train, valid, test = split_data(user_item_matrix)
     # create warp sampler
     sampler = WarpSampler(train, batch_size=BATCH_SIZE, n_negative=N_NEGATIVE)
 
-    # WITHOUT features
+    # # WITHOUT features
+    # # Train a user-item joint embedding, where the items a user likes will be pulled closer to this users.
+    # # Once the embedding is trained, the recommendations are made by finding the k-Nearest-Neighbor to each user.
+    # model = CML(n_users,
+    #             n_items,
+    #             # set features to None to disable feature projection
+    #             features=None,
+    #             # size of embedding
+    #             embed_dim=EMBED_DIM,
+    #             # the size of hinge loss margin.
+    #             margin=1.0,
+    #             # clip the embedding so that their norm <= clip_norm
+    #             clip_norm=1.1,
+    #             # learning rate for AdaGrad
+    #             master_learning_rate=0.5,
+    #             )
+    #
+    # optimize(model, sampler, train, valid)
+
+    # WITH features. In this case, we additionally train a feature projector to project raw item features into the
+    # embedding. The projection serves as "a prior" to inform the item's potential location in the embedding.
+    # We use a two fully-connected layers NN as our feature projector. (This model is much more computation intensive.
+    # A GPU machine is recommended)
     model = CML(n_users,
                 n_items,
-                features=None,
-                embed_dim=EMBED_DIM,
-                margin=1.0,
-                clip_norm=1.1,
-                master_learning_rate=0.5,
-                )
-
-    optimize(model, sampler, train, valid)
-
-    # WITH features (This is much more computation intensive than WITHOUT features. A GPU machine is recommended)
-    model = CML(n_users,
-                n_items,
+                # enable feature projection
                 features=dense_features,
                 embed_dim=EMBED_DIM,
                 margin=1.0,
                 clip_norm=1.1,
                 master_learning_rate=0.5,
+                # the size of the hidden layer in the feature projector NN
                 hidden_layer_dim=128,
-                feature_l2_reg=0.1,
-                dropout_rate=0.3
+                # dropout rate between hidden layer and output layer in the feature projector NN
+                dropout_rate=0.3,
+                # scale the output of the NN so that the magnitude of the NN output is closer to the item embedding
+                feature_projection_scaling_factor=0.1,
+                # the penalty to the distance between projection and item's actual location in the embedding
+                # tune this to adjust how much the embedding should be biased towards the item features.
+                feature_l2_reg=1,
+
+
                 )
     optimize(model, sampler, train, valid)
