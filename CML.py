@@ -336,7 +336,7 @@ def optimize(model, sampler, train, valid):
         # train model
         losses = []
         # run n mini-batches
-        for _ in tqdm(range(EVALUATION_EVERY_N_BATCHES), desc="Optimize..."):
+        for _ in tqdm(range(EVALUATION_EVERY_N_BATCHES), desc="Optimizing..."):
             user_pos, neg = sampler.next_batch()
             _, loss = sess.run((model.optimize, model.loss),
                                {model.user_positive_items_pairs: user_pos,
@@ -356,24 +356,24 @@ if __name__ == '__main__':
     # create warp sampler
     sampler = WarpSampler(train, batch_size=BATCH_SIZE, n_negative=N_NEGATIVE)
 
-    # # WITHOUT features
-    # # Train a user-item joint embedding, where the items a user likes will be pulled closer to this users.
-    # # Once the embedding is trained, the recommendations are made by finding the k-Nearest-Neighbor to each user.
-    # model = CML(n_users,
-    #             n_items,
-    #             # set features to None to disable feature projection
-    #             features=None,
-    #             # size of embedding
-    #             embed_dim=EMBED_DIM,
-    #             # the size of hinge loss margin.
-    #             margin=1.0,
-    #             # clip the embedding so that their norm <= clip_norm
-    #             clip_norm=1.1,
-    #             # learning rate for AdaGrad
-    #             master_learning_rate=0.5,
-    #             )
-    #
-    # optimize(model, sampler, train, valid)
+    # WITHOUT features
+    # Train a user-item joint embedding, where the items a user likes will be pulled closer to this users.
+    # Once the embedding is trained, the recommendations are made by finding the k-Nearest-Neighbor to each user.
+    model = CML(n_users,
+                n_items,
+                # set features to None to disable feature projection
+                features=None,
+                # size of embedding
+                embed_dim=EMBED_DIM,
+                # the size of hinge loss margin.
+                margin=1.0,
+                # clip the embedding so that their norm <= clip_norm
+                clip_norm=1.1,
+                # learning rate for AdaGrad
+                master_learning_rate=0.5,
+                )
+
+    optimize(model, sampler, train, valid)
 
     # WITH features. In this case, we additionally train a feature projector to project raw item features into the
     # embedding. The projection serves as "a prior" to inform the item's potential location in the embedding.
