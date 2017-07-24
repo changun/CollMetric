@@ -22,3 +22,6 @@ pip3 install -r requirements.txt
 # run demo tensorflow model
 python3 CML.py
 ```
+# TODO
+* Model Comparison.
+* TensorBoard visualization
