@@ -22,6 +22,11 @@ pip3 install -r requirements.txt
 # run demo tensorflow model
 python3 CML.py
 ```
+# Visuals
+### An illustration of embbeding learning procedue of CML
+![CML](http://portalparts.acm.org/3060000/3052639/core/fp0554.jpg)
+### Flickr photo recommendation embedding produced by CML (compared to original ImageNet features)
+![Embedding](https://github.com/changun/CollMetric/blob/master/imgs/embedding.png?raw=true)
 # TODO
 * Model Comparison.
 * TensorBoard visualization
