@@ -248,7 +248,6 @@ class CML(object):
         # best negative item (among W negative samples) their distance to the user embedding (N)
         closest_negative_distances = tf.reduce_min(distance_to_neg_items, 1, name="closest_negative_distances")
 
-
         # compute hinge loss (N)
         loss_per_pair = tf.maximum(pos_distances - closest_negative_distances + self.margin, 0,
                                    name="pair_loss")
@@ -320,6 +319,8 @@ def optimize(model, sampler, train, valid):
                                   for user, user_scores in zip(user_chunk, scores)]
                                  )
         print("\nRecall on (sampled) validation set: {}".format(numpy.mean(valid_recalls)))
+        # TODO: early stopping based on validation recall
+
 
         # train model
         losses = []
@@ -333,9 +334,10 @@ def optimize(model, sampler, train, valid):
         print("\nTraining loss {}".format(numpy.mean(losses)))
 
 
+
 if __name__ == '__main__':
     # get user-item matrix
-    user_item_matrix, features = citeulike(tag_occurence_thres=20)
+    user_item_matrix, features = citeulike(tag_occurence_thres=10)
     n_users, n_items = user_item_matrix.shape
     # make feature as dense matrix
     dense_features = sklearn.preprocessing.normalize(features.toarray() + 1E-10)
@@ -356,7 +358,7 @@ if __name__ == '__main__':
 
     optimize(model, sampler, train, valid)
 
-    # WITH features
+    # WITH features (This is much more computation intensive than WITHOUT features. A GPU machine is recommended)
     model = CML(n_users,
                 n_items,
                 features=dense_features,
@@ -365,8 +367,7 @@ if __name__ == '__main__':
                 clip_norm=1.1,
                 master_learning_rate=0.5,
                 hidden_layer_dim=128,
-                feature_l2_reg=1,
-                dropout_rate=0.5
+                feature_l2_reg=0.1,
+                dropout_rate=0.3
                 )
     optimize(model, sampler, train, valid)
-
