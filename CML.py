@@ -1,0 +1,372 @@
+import functools
+import numpy
+import sklearn.preprocessing
+import tensorflow as tf
+import toolz
+from scipy.sparse import lil_matrix, dok_matrix
+from tqdm import tqdm
+from utils import citeulike, split_data
+
+
+def doublewrap(function):
+    """
+    A decorator decorator, allowing to use the decorator to be used without
+    parentheses if not arguments are provided. All arguments must be optional.
+    """
+
+    @functools.wraps(function)
+    def decorator(*args, **kwargs):
+        if len(args) == 1 and len(kwargs) == 0 and callable(args[0]):
+            return function(args[0])
+        else:
+            return lambda wrapee: function(wrapee, *args, **kwargs)
+
+    return decorator
+
+
+@doublewrap
+def define_scope(function, scope=None, *args, **kwargs):
+    """
+    A decorator for functions that define TensorFlow operations. The wrapped
+    function will only be executed once. Subsequent calls to it will directly
+    return the result so that operations are added to the graph only once.
+    The operations added by the function live within a tf.variable_scope(). If
+    this decorator is used with arguments, they will be forwarded to the
+    variable scope. The scope name defaults to the name of the wrapped
+    function.
+    """
+    attribute = '_cache_' + function.__name__
+    name = scope or function.__name__
+
+    @property
+    @functools.wraps(function)
+    def decorator(self):
+        if not hasattr(self, attribute):
+            with tf.variable_scope(name, *args, **kwargs):
+                setattr(self, attribute, function(self))
+        return getattr(self, attribute)
+
+    return decorator
+
+
+class RecallEvaluator(object):
+    def __init__(self, train_user_item_matrix, test_user_item_matrix):
+
+        self.train_user_item_matrix = lil_matrix(train_user_item_matrix)
+        self.test_user_item_matrix = lil_matrix(test_user_item_matrix)
+        n_users = train_user_item_matrix.shape[0]
+        self.user_to_test_set = {u: set(self.test_user_item_matrix[u, :].nonzero()[1])
+                                 for u in range(n_users) if self.test_user_item_matrix[u, :].sum()}
+
+        if self.train_user_item_matrix is not None:
+            self.user_to_train_items = {u: list(self.train_user_item_matrix[u, :].nonzero()[1])
+                                        for u in range(n_users) if self.train_user_item_matrix[u, :].sum()}
+
+    def eval(self, user_id, item_scores, k=50):
+        """
+        Compute the Top-K recall for a particular user given the predicted scores to items
+        :param user_id: the user id
+        :param item_scores: an array contains the predicted score to every item
+        :param k: compute the recall for the top K items
+        :return: recall@K
+        """
+        if self.train_user_item_matrix is not None:
+            item_scores[self.user_to_train_items[user_id]] = -numpy.Inf
+        top_items = numpy.argpartition(-item_scores, k)[:k]
+        test_set = self.user_to_test_set[user_id]
+        return sum([1.0 for i in top_items if i in test_set]) / float(len(test_set))
+
+
+class WarpSampler(object):
+    """
+    A generator that generate tuples: user-positive-item pairs, negative-items
+
+    of shapes (Batch Size, 2) and (Batch Size, N_Negative)
+    """
+
+    def __init__(self, user_item_matrix, batch_size=10000, n_negative=10):
+        self.user_item_matrix = dok_matrix(user_item_matrix)
+        self.user_item_pairs = numpy.asarray(self.user_item_matrix.nonzero()).T
+        self.batch_size = batch_size
+        self.n_negative = n_negative
+
+    @property
+    def sample(self):
+        while True:
+            numpy.random.shuffle(self.user_item_pairs)
+            for i in range(int(len(self.user_item_pairs) / self.batch_size)):
+                user_positive_items_pairs = self.user_item_pairs[i * self.batch_size: (i + 1) * self.batch_size, :]
+
+                negative_samples = numpy.random.randint(0,
+                                                        self.user_item_matrix.shape[1],
+                                                        size=(self.batch_size, self.n_negative))
+
+                yield user_positive_items_pairs, negative_samples
+
+    def next_batch(self):
+        return self.sample.__next__()
+
+
+class CML(object):
+    def __init__(self,
+                 n_users,
+                 n_items,
+                 embed_dim=20,
+                 features=None,
+                 margin=0.1,
+                 master_learning_rate=0.1,
+                 clip_norm=1.0,
+                 hidden_layer_dim=128,
+                 dropout_rate=0.2,
+                 feature_l2_reg=0.1,
+                 feature_projection_scaling_factor=0.5
+                 ):
+        """
+
+        :param n_users: number of users i.e. |U|
+        :param n_items: number of items i.e. |V|
+        :param
+        :param embed_dim: embedding size i.e. K (default 20)
+        :param features: (optional) the feature vectors of items, shape: (|V|, N_Features).
+               Set it to None will disable feature loss(default: None)
+        :param margin: hinge loss threshold i.e. z
+        :param master_learning_rate: master learning rate for AdaGrad
+        :param clip_norm: clip norm threshold (default 1.0)
+        :param hidden_layer_dim: the size of feature projector's hidden layer (default: 128)
+        :param dropout_rate: the dropout rate between the hidden layer to final feature projection layer
+        :param feature_l2_reg: feature loss weight
+        :param feature_projection_scaling_factor: scale the feature projection before compute l2 loss. Ideally,
+               the scaled feature projection should be mostly within the clip_norm
+        """
+
+        self.n_users = n_users
+        self.n_items = n_items
+        self.embed_dim = embed_dim
+
+        self.clip_norm = clip_norm
+        self.margin = margin
+        if features is not None:
+            self.features = tf.constant(features, dtype=tf.float32)
+        else:
+            self.features = None
+
+        self.master_learning_rate = master_learning_rate
+        self.hidden_layer_dim = hidden_layer_dim
+        self.dropout_rate = dropout_rate
+        self.feature_l2_reg = feature_l2_reg
+        self.feature_projection_scaling_factor = feature_projection_scaling_factor
+
+        self.user_positive_items_pairs = tf.placeholder(tf.int32, [None, 2])
+        self.negative_samples = tf.placeholder(tf.int32, [None, None])
+        self.score_user_ids = tf.placeholder(tf.int32, [None])
+        self.user_embeddings
+        self.item_embeddings
+        self.embedding_loss
+        self.feature_loss
+        self.loss
+        self.optimize
+
+    @define_scope
+    def user_embeddings(self):
+        return tf.Variable(tf.random_normal([self.n_users, self.embed_dim],
+                                            stddev=1 / (self.embed_dim ** 0.5), dtype=tf.float32))
+
+    @define_scope
+    def item_embeddings(self):
+        return tf.Variable(tf.random_normal([self.n_items, self.embed_dim],
+                                            stddev=1 / (self.embed_dim ** 0.5), dtype=tf.float32))
+
+    @define_scope
+    def feature_projection(self):
+        """
+        :return: the projection of the feature vectors to the user-item embedding
+        """
+
+        # feature loss
+        if self.features is not None:
+            # one fully-connected layer
+            dense = tf.layers.dense(inputs=self.features,
+                                    units=self.hidden_layer_dim,
+                                    activation=tf.nn.relu)
+            # dropout layer
+            dropout = tf.layers.dropout(inputs=dense, rate=self.dropout_rate)
+
+            # scaled output layer
+            output = tf.layers.dense(inputs=dropout, units=self.embed_dim) * self.feature_projection_scaling_factor
+
+            # projection to the embedding
+            return tf.clip_by_norm(output, self.clip_norm, axes=[1], name="feature_projection")
+
+    @define_scope
+    def feature_loss(self):
+        """
+        :return: the l2 loss of the distance between items' their embedding and their feature projection
+        """
+        if self.feature_projection is not None:
+
+            # the distance between feature projection and the item's actual location in the embedding
+            feature_distance = tf.reduce_mean(tf.squared_difference(
+                self.item_embeddings,
+                self.feature_projection) + 1E-10, 1)
+
+            # apply regularization weight
+            return tf.reduce_sum(feature_distance, name="feature_loss") * self.feature_l2_reg
+        else:
+            return tf.constant(0, dtype=tf.float32)
+
+    @define_scope
+    def embedding_loss(self):
+        """
+        :return: the distance metric loss
+        """
+        # Let
+        # N = batch size,
+        # K = embedding size,
+        # W = number of negative samples per a user-positive-item pair
+
+        # user embedding (N, K)
+        users = tf.nn.embedding_lookup(self.user_embeddings,
+                                       self.user_positive_items_pairs[:, 0],
+                                       name="users")
+
+        # positive item embedding (N, K)
+        pos_items = tf.nn.embedding_lookup(self.item_embeddings, self.user_positive_items_pairs[:, 1],
+                                           name="pos_items")
+        # positive item to user distance (N)
+        pos_distances = tf.reduce_mean(tf.squared_difference(users, pos_items), 1, name="pos_distances")
+
+        # negative item embedding (N, K, W)
+        neg_items = tf.transpose(tf.nn.embedding_lookup(self.item_embeddings, self.negative_samples),
+                                 (0, 2, 1), name="neg_items")
+        # distance to negative items (N x W)
+        distance_to_neg_items = tf.reduce_mean(tf.squared_difference(tf.expand_dims(users, -1), neg_items), 1,
+                                               name="distance_to_neg_items")
+
+        # number of impostors for each user-positive-item pair
+        impostors = (tf.expand_dims(pos_distances, -1) - distance_to_neg_items + self.margin) > 0
+
+        # best negative item (among W negative samples) their distance to the user embedding (N)
+        closest_negative_distances = tf.reduce_min(distance_to_neg_items, 1, name="closest_negative_distances")
+
+
+        # compute hinge loss (N)
+        loss_per_pair = tf.maximum(pos_distances - closest_negative_distances + self.margin, 0,
+                                   name="pair_loss")
+        weighted_loss_per_pair = loss_per_pair
+
+        # the embedding loss
+        loss = tf.reduce_sum(weighted_loss_per_pair, name="loss")
+
+        return loss
+
+    @define_scope
+    def loss(self):
+        """
+        :return: the total loss = embedding loss + feature loss
+        """
+        return self.embedding_loss + self.feature_loss
+
+    @define_scope
+    def clip_by_norm_op(self):
+        return [tf.assign(self.user_embeddings, tf.clip_by_norm(self.user_embeddings, self.clip_norm, axes=[1])),
+                tf.assign(self.item_embeddings, tf.clip_by_norm(self.item_embeddings, self.clip_norm, axes=[1]))]
+
+    @define_scope
+    def optimize(self):
+        gd = tf.train.AdagradOptimizer(self.master_learning_rate).minimize(self.loss)
+        with tf.control_dependencies([gd]):
+            return [gd, self.clip_by_norm_op]
+
+    @define_scope
+    def item_scores(self):
+        # (N_USER_IDS, 1, K)
+        user = tf.expand_dims(tf.nn.embedding_lookup(self.user_embeddings, self.score_user_ids), 1)
+        # (1, N_ITEM, K)
+        item = tf.expand_dims(self.item_embeddings, 0)
+        # score = minus distance (N_USER, N_ITEM)
+        return -tf.reduce_sum(tf.squared_difference(user, item), 2, name="scores")
+
+
+BATCH_SIZE = 10000
+N_NEGATIVE = 10
+EVALUATION_EVERY_N_BATCHES = 10
+EMBED_DIM = 50
+
+
+def optimize(model, sampler, train, valid):
+    """
+    Optimize the model. TODO: implement early-stopping
+    :param model: model to optimize
+    :param sampler: mini-batch sampler
+    :param train: train user-item matrix
+    :param valid: validation user-item matrix
+    :return: None
+    """
+    sess = tf.Session()
+    sess.run(tf.global_variables_initializer())
+    if model.feature_projection is not None:
+        # initialize item embedding with feature projection
+        sess.run(tf.assign(model.item_embeddings, model.feature_projection))
+    while True:
+        # create evaluator on validation set
+        validation_recall = RecallEvaluator(train, valid)
+        # compute recall on validate set
+        valid_recalls = []
+        # sample some users to calculate recall validation
+        valid_users = list(set(valid.nonzero()[0]))[:300]
+        for user_chunk in toolz.partition_all(300, valid_users):
+            scores = sess.run(model.item_scores, {model.score_user_ids: user_chunk})
+            valid_recalls.extend([validation_recall.eval(user, user_scores)
+                                  for user, user_scores in zip(user_chunk, scores)]
+                                 )
+        print("\nRecall on (sampled) validation set: {}".format(numpy.mean(valid_recalls)))
+
+        # train model
+        losses = []
+        # run n mini-batches
+        for _ in tqdm(range(EVALUATION_EVERY_N_BATCHES), desc="Optimize..."):
+            user_pos, neg = sampler.next_batch()
+            _, loss = sess.run((model.optimize, model.loss),
+                               {model.user_positive_items_pairs: user_pos,
+                                model.negative_samples: neg})
+            losses.append(loss)
+        print("\nTraining loss {}".format(numpy.mean(losses)))
+
+
+if __name__ == '__main__':
+    # get user-item matrix
+    user_item_matrix, features = citeulike(tag_occurence_thres=20)
+    n_users, n_items = user_item_matrix.shape
+    # make feature as dense matrix
+    dense_features = sklearn.preprocessing.normalize(features.toarray() + 1E-10)
+    # get train/valid/test user-item matrices
+    train, valid, test = split_data(user_item_matrix)
+    # create warp sampler
+    sampler = WarpSampler(train, batch_size=BATCH_SIZE, n_negative=N_NEGATIVE)
+
+
+    # # WITH features
+    # model = CML(n_users,
+    #             n_items,
+    #             features=dense_features,
+    #             embed_dim=EMBED_DIM,
+    #             margin=1.0,
+    #             clip_norm=1.1,
+    #             master_learning_rate=0.5,
+    #             hidden_layer_dim=128,
+    #             feature_l2_reg=1,
+    #             dropout_rate=0.5
+    #             )
+    # optimize(model, sampler, train, valid)
+
+    # WITHOUT features
+    model = CML(n_users,
+                n_items,
+                features=None,
+                embed_dim=EMBED_DIM,
+                margin=1.0,
+                clip_norm=1.1,
+                master_learning_rate=0.5,
+                )
+
+    optimize(model, sampler, train, valid)
