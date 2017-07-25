@@ -60,7 +60,7 @@ class RecallEvaluator(object):
 
         if self.train_user_item_matrix is not None:
             self.user_to_train_set = {u: set(self.train_user_item_matrix[u, :].nonzero()[1])
-                                        for u in range(n_users) if self.train_user_item_matrix[u, :].sum()}
+                                      for u in range(n_users) if self.train_user_item_matrix[u, :].sum()}
 
     def eval(self, user_id, item_scores, k=50):
         """
@@ -185,11 +185,13 @@ class CML(object):
     def item_embeddings(self):
         return tf.Variable(tf.random_normal([self.n_items, self.embed_dim],
                                             stddev=1 / (self.embed_dim ** 0.5), dtype=tf.float32))
+
     @define_scope
     def mlp_layer_1(self):
         return tf.layers.dense(inputs=self.features,
-                                    units=self.hidden_layer_dim,
-                                    activation=tf.nn.relu, name="mlp_layer_1")
+                               units=self.hidden_layer_dim,
+                               activation=tf.nn.relu, name="mlp_layer_1")
+
     @define_scope
     def mlp_layer_2(self):
         dropout = tf.layers.dropout(inputs=self.mlp_layer_1, rate=self.dropout_rate)
@@ -286,16 +288,17 @@ class CML(object):
     def optimize(self):
         # have two separate learning rates. The first one for user/item embedding is un-normalized.
         # The second one for feature projector NN is normalized by the number of items.
-        gd = tf.train\
-            .AdagradOptimizer(self.master_learning_rate)\
-            .minimize(self.loss, var_list=[self.user_embeddings, self.item_embeddings])
+        gds = []
+        gds.append(tf.train
+                   .AdagradOptimizer(self.master_learning_rate)
+                   .minimize(self.loss, var_list=[self.user_embeddings, self.item_embeddings]))
+        if self.feature_projection:
+            gds.append(tf.train
+                       .AdagradOptimizer(self.master_learning_rate)
+                       .minimize(self.feature_loss / self.n_items))
 
-        gd2 = tf.train \
-            .AdagradOptimizer(self.master_learning_rate) \
-            .minimize(self.feature_loss/self.n_items)
-
-        with tf.control_dependencies([gd, gd2]):
-            return [gd, gd2, self.clip_by_norm_op]
+        with tf.control_dependencies(gds):
+            return gds + [self.clip_by_norm_op]
 
     @define_scope
     def item_scores(self):
@@ -396,7 +399,7 @@ if __name__ == '__main__':
                 features=dense_features,
                 embed_dim=EMBED_DIM,
                 margin=1.0,
-                clip_norm=1.1,
+                clip_norm=1.5,
                 master_learning_rate=0.1,
                 # the size of the hidden layer in the feature projector NN
                 hidden_layer_dim=256,
@@ -406,6 +409,6 @@ if __name__ == '__main__':
                 feature_projection_scaling_factor=1,
                 # the penalty to the distance between projection and item's actual location in the embedding
                 # tune this to adjust how much the embedding should be biased towards the item features.
-                feature_l2_reg=1,
+                feature_l2_reg=5,
                 )
     optimize(model, sampler, train, valid)
