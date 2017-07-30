@@ -33,6 +33,7 @@ class RecallEvaluator(object):
         :return: recall@K
         """
         # compute the top (K +  Max Number Of Training Items for any user) items for each user
+
         _, user_tops = sess.run(tf.nn.top_k(self.model.item_scores, k + self.max_train_count),
                                 {self.model.score_user_ids: users})
         recalls = []

@@ -199,13 +199,13 @@ class CML(object):
         pos_items = tf.nn.embedding_lookup(self.item_embeddings, self.user_positive_items_pairs[:, 1],
                                            name="pos_items")
         # positive item to user distance (N)
-        pos_distances = tf.reduce_sum(tf.squared_difference(users, pos_items), 1, name="pos_distances")
+        pos_distances = tf.reduce_mean(tf.squared_difference(users, pos_items), 1, name="pos_distances")
 
         # negative item embedding (N, K, W)
         neg_items = tf.transpose(tf.nn.embedding_lookup(self.item_embeddings, self.negative_samples),
                                  (0, 2, 1), name="neg_items")
         # distance to negative items (N x W)
-        distance_to_neg_items = tf.reduce_sum(tf.squared_difference(tf.expand_dims(users, -1), neg_items), 1,
+        distance_to_neg_items = tf.reduce_mean(tf.squared_difference(tf.expand_dims(users, -1), neg_items), 1,
                                               name="distance_to_neg_items")
 
         # best negative item (among W negative samples) their distance to the user embedding (N)
@@ -219,9 +219,9 @@ class CML(object):
             # indicator matrix for impostors (N x W)
             impostors = (tf.expand_dims(pos_distances, -1) - distance_to_neg_items + self.margin) > 0
             # approximate the rank of positive item by (number of impostor / W per user-positive pair)
-            weight = tf.reduce_mean(tf.cast(impostors, dtype=tf.float32), 1, name="rank_weight")
+            rank = tf.reduce_mean(tf.cast(impostors, dtype=tf.float32), 1, name="rank_weight")
             # apply rank weight
-            loss_per_pair *= weight
+            loss_per_pair *= tf.log(rank * self.n_items + 1)
 
         # the embedding loss
         loss = tf.reduce_sum(loss_per_pair, name="loss")
@@ -271,7 +271,7 @@ class CML(object):
 
 BATCH_SIZE = 50000
 N_NEGATIVE = 20
-EVALUATION_EVERY_N_BATCHES = 100
+EVALUATION_EVERY_N_BATCHES = 30
 EMBED_DIM = 50
 
 
@@ -289,13 +289,15 @@ def optimize(model, sampler, train, valid):
     if model.feature_projection is not None:
         # initialize item embedding with feature projection
         sess.run(tf.assign(model.item_embeddings, model.feature_projection))
+
+    # sample some users to calculate recall validation
+    valid_users = numpy.random.choice(list(set(valid.nonzero()[0])), size=1000, replace=False)
+
     while True:
         # create evaluator on validation set
         validation_recall = RecallEvaluator(model, train, valid)
         # compute recall on validate set
         valid_recalls = []
-        # sample some users to calculate recall validation
-        valid_users = list(set(valid.nonzero()[0]))[:1000]
 
         # compute recall in chunks to utilize speedup provided by Tensorflow
         for user_chunk in toolz.partition_all(100, valid_users):
@@ -342,9 +344,16 @@ if __name__ == '__main__':
                 # learning rate for AdaGrad
                 master_learning_rate=0.5,
 
-                use_rank_weight=False,
+                # whether to enable rank weight. If True, the loss will be scaled by the estimated
+                # log-rank of the positive items. If False, no weight will be applied.
+                # This is particularly useful when the number of items is large (see ).
+                use_rank_weight=True,
+
+                # whether to enable covariance regularization to encourage efficient use of the vector space.
+                # More useful when the size of embedding is smaller (e.g. < 20 ).
                 use_cov_loss=True,
-                cov_loss_weight=0.1
+                # weight of the cov_loss
+                cov_loss_weight=1
                 )
 
     optimize(model, sampler, train, valid)
