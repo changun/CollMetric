@@ -1,6 +1,5 @@
 from collections import defaultdict
 
-import random
 import numpy as np
 from scipy.sparse import dok_matrix, lil_matrix
 from tqdm import tqdm
@@ -40,13 +39,15 @@ def citeulike(tag_occurence_thres=10):
 
 
 def split_data(user_item_matrix, split_ratio=(3, 1, 1), seed=1):
+    # set the seed to have deterministic results
     np.random.seed(seed)
     train = dok_matrix(user_item_matrix.shape)
     validation = dok_matrix(user_item_matrix.shape)
     test = dok_matrix(user_item_matrix.shape)
+    # convert it to lil format for fast row access
     user_item_matrix = lil_matrix(user_item_matrix)
     for user in tqdm(range(user_item_matrix.shape[0]), desc="Split data into train/valid/test"):
-        items = list(user_item_matrix[user, :].nonzero()[1])
+        items = list(user_item_matrix.rows[user])
         if len(items) >= 5:
 
             np.random.shuffle(items)
