@@ -1,6 +1,7 @@
 import functools
 
 import numpy
+import pandas
 import tensorflow as tf
 import toolz
 from tqdm import tqdm
@@ -57,7 +58,7 @@ class CML(object):
                  n_items,
                  embed_dim=20,
                  features=None,
-                 margin=0.1,
+                 margin=1.5,
                  master_learning_rate=0.1,
                  clip_norm=1.0,
                  hidden_layer_dim=128,
@@ -103,14 +104,15 @@ class CML(object):
         self.dropout_rate = dropout_rate
         self.feature_l2_reg = feature_l2_reg
         self.feature_projection_scaling_factor = feature_projection_scaling_factor
+        self.use_rank_weight = use_rank_weight
+        self.use_cov_loss = use_cov_loss
+        self.cov_loss_weight = cov_loss_weight
+
 
         self.user_positive_items_pairs = tf.placeholder(tf.int32, [None, 2])
         self.negative_samples = tf.placeholder(tf.int32, [None, None])
         self.score_user_ids = tf.placeholder(tf.int32, [None])
 
-        self.use_rank_weight = use_rank_weight
-        self.use_cov_loss = use_cov_loss
-        self.cov_loss_weight = cov_loss_weight
 
         self.user_embeddings
         self.item_embeddings
@@ -118,6 +120,7 @@ class CML(object):
         self.feature_loss
         self.loss
         self.optimize
+
 
     @define_scope
     def user_embeddings(self):
@@ -199,29 +202,29 @@ class CML(object):
         pos_items = tf.nn.embedding_lookup(self.item_embeddings, self.user_positive_items_pairs[:, 1],
                                            name="pos_items")
         # positive item to user distance (N)
-        pos_distances = tf.reduce_mean(tf.squared_difference(users, pos_items), 1, name="pos_distances")
+        pos_distances = tf.reduce_sum(tf.squared_difference(users, pos_items), 1, name="pos_distances")
 
         # negative item embedding (N, K, W)
         neg_items = tf.transpose(tf.nn.embedding_lookup(self.item_embeddings, self.negative_samples),
                                  (0, 2, 1), name="neg_items")
         # distance to negative items (N x W)
-        distance_to_neg_items = tf.reduce_mean(tf.squared_difference(tf.expand_dims(users, -1), neg_items), 1,
+        distance_to_neg_items = tf.reduce_sum(tf.squared_difference(tf.expand_dims(users, -1), neg_items), 1,
                                               name="distance_to_neg_items")
 
         # best negative item (among W negative samples) their distance to the user embedding (N)
-        closest_negative_distances = tf.reduce_min(distance_to_neg_items, 1, name="closest_negative_distances")
+        closest_negative_item_distances = tf.reduce_min(distance_to_neg_items, 1, name="closest_negative_distances")
 
         # compute hinge loss (N)
-        loss_per_pair = tf.maximum(pos_distances - closest_negative_distances + self.margin, 0,
+        loss_per_pair = tf.maximum(pos_distances - closest_negative_item_distances + self.margin, 0,
                                    name="pair_loss")
 
         if self.use_rank_weight:
             # indicator matrix for impostors (N x W)
             impostors = (tf.expand_dims(pos_distances, -1) - distance_to_neg_items + self.margin) > 0
             # approximate the rank of positive item by (number of impostor / W per user-positive pair)
-            rank = tf.reduce_mean(tf.cast(impostors, dtype=tf.float32), 1, name="rank_weight")
+            rank = tf.reduce_mean(tf.cast(impostors, dtype=tf.float32), 1, name="rank_weight") * self.n_items
             # apply rank weight
-            loss_per_pair *= tf.log(rank * self.n_items + 1)
+            loss_per_pair *= tf.log(rank + 1)
 
         # the embedding loss
         loss = tf.reduce_sum(loss_per_pair, name="loss")
@@ -251,7 +254,7 @@ class CML(object):
         gds.append(tf.train
                    .AdagradOptimizer(self.master_learning_rate)
                    .minimize(self.loss, var_list=[self.user_embeddings, self.item_embeddings]))
-        if self.feature_projection:
+        if self.feature_projection is not None:
             gds.append(tf.train
                        .AdagradOptimizer(self.master_learning_rate)
                        .minimize(self.feature_loss / self.n_items))
@@ -272,7 +275,7 @@ class CML(object):
 BATCH_SIZE = 50000
 N_NEGATIVE = 20
 EVALUATION_EVERY_N_BATCHES = 30
-EMBED_DIM = 50
+EMBED_DIM = 100
 
 
 def optimize(model, sampler, train, valid):
@@ -313,7 +316,9 @@ def optimize(model, sampler, train, valid):
             _, loss = sess.run((model.optimize, model.loss),
                                {model.user_positive_items_pairs: user_pos,
                                 model.negative_samples: neg})
+
             losses.append(loss)
+
         print("\nTraining loss {}".format(numpy.mean(losses)))
 
 
@@ -326,7 +331,7 @@ if __name__ == '__main__':
     # get train/valid/test user-item matrices
     train, valid, test = split_data(user_item_matrix)
     # create warp sampler
-    sampler = WarpSampler(train, batch_size=BATCH_SIZE, n_negative=N_NEGATIVE)
+    sampler = WarpSampler(train, batch_size=BATCH_SIZE, n_negative=N_NEGATIVE, check_negative=True)
 
     # WITHOUT features
     # Train a user-item joint embedding, where the items a user likes will be pulled closer to this users.
@@ -338,20 +343,25 @@ if __name__ == '__main__':
                 # size of embedding
                 embed_dim=EMBED_DIM,
                 # the size of hinge loss margin.
-                margin=1.0,
+                margin=1.9,
                 # clip the embedding so that their norm <= clip_norm
-                clip_norm=1.1,
+                clip_norm=1,
                 # learning rate for AdaGrad
-                master_learning_rate=0.5,
+                master_learning_rate=0.1,
 
                 # whether to enable rank weight. If True, the loss will be scaled by the estimated
                 # log-rank of the positive items. If False, no weight will be applied.
-                # This is particularly useful when the number of items is large (see ).
+
+                # This is particularly useful to speed up the training for large item set.
+
+                # Weston, Jason, Samy Bengio, and Nicolas Usunier.
+                # "Wsabie: Scaling up to large vocabulary image annotation." IJCAI. Vol. 11. 2011.
                 use_rank_weight=True,
 
                 # whether to enable covariance regularization to encourage efficient use of the vector space.
                 # More useful when the size of embedding is smaller (e.g. < 20 ).
-                use_cov_loss=True,
+                use_cov_loss=False,
+
                 # weight of the cov_loss
                 cov_loss_weight=1
                 )
@@ -369,16 +379,32 @@ if __name__ == '__main__':
                 features=dense_features,
                 embed_dim=EMBED_DIM,
                 margin=1.0,
-                clip_norm=1.5,
+                clip_norm=1.1,
                 master_learning_rate=0.1,
                 # the size of the hidden layer in the feature projector NN
-                hidden_layer_dim=256,
+                hidden_layer_dim=512,
                 # dropout rate between hidden layer and output layer in the feature projector NN
-                dropout_rate=0.5,
+                dropout_rate=0.3,
                 # scale the output of the NN so that the magnitude of the NN output is closer to the item embedding
                 feature_projection_scaling_factor=1,
                 # the penalty to the distance between projection and item's actual location in the embedding
                 # tune this to adjust how much the embedding should be biased towards the item features.
-                feature_l2_reg=5,
+                feature_l2_reg=0.1,
+
+                # whether to enable rank weight. If True, the loss will be scaled by the estimated
+                # log-rank of the positive items. If False, no weight will be applied.
+
+                # This is particularly useful to speed up the training for large item set.
+
+                # Weston, Jason, Samy Bengio, and Nicolas Usunier.
+                # "Wsabie: Scaling up to large vocabulary image annotation." IJCAI. Vol. 11. 2011.
+                use_rank_weight=True,
+
+                # whether to enable covariance regularization to encourage efficient use of the vector space.
+                # More useful when the size of embedding is smaller (e.g. < 20 ).
+                use_cov_loss=True,
+
+                # weight of the cov_loss
+                cov_loss_weight=1
                 )
     optimize(model, sampler, train, valid)
