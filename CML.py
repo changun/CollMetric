@@ -1,10 +1,12 @@
 import functools
+
 import numpy
-import sklearn.preprocessing
 import tensorflow as tf
 import toolz
-from scipy.sparse import lil_matrix, dok_matrix
 from tqdm import tqdm
+
+from evaluator import RecallEvaluator
+from sampler import WarpSampler
 from utils import citeulike, split_data
 
 
@@ -49,74 +51,6 @@ def define_scope(function, scope=None, *args, **kwargs):
     return decorator
 
 
-class RecallEvaluator(object):
-    def __init__(self, train_user_item_matrix, test_user_item_matrix):
-
-        self.train_user_item_matrix = lil_matrix(train_user_item_matrix)
-        self.test_user_item_matrix = lil_matrix(test_user_item_matrix)
-        n_users = train_user_item_matrix.shape[0]
-        self.user_to_test_set = {u: set(self.test_user_item_matrix[u, :].nonzero()[1])
-                                 for u in range(n_users) if self.test_user_item_matrix[u, :].sum()}
-
-        if self.train_user_item_matrix is not None:
-            self.user_to_train_set = {u: set(self.train_user_item_matrix[u, :].nonzero()[1])
-                                      for u in range(n_users) if self.train_user_item_matrix[u, :].sum()}
-
-    def eval(self, user_id, item_scores, k=50):
-        """
-        Compute the Top-K recall for a particular user given the predicted scores to items
-        :param user_id: the user id
-        :param item_scores: an array contains the predicted score to every item
-        :param k: compute the recall for the top K items
-        :return: recall@K
-        """
-        train_set = self.user_to_train_set[user_id]
-        test_set = self.user_to_test_set[user_id]
-
-        top_items = numpy.argpartition(-item_scores, k + len(train_set))[:k + len(train_set)]
-        top_n_items = 0
-        hits = 0
-        for i in top_items:
-            if i in train_set:
-                continue
-            if i in test_set:
-                hits += 1
-            top_n_items += 1
-            if top_n_items == k:
-                break
-        return hits / float(len(test_set))
-
-
-class WarpSampler(object):
-    """
-    A generator that generate tuples: user-positive-item pairs, negative-items
-
-    of shapes (Batch Size, 2) and (Batch Size, N_Negative)
-    """
-
-    def __init__(self, user_item_matrix, batch_size=10000, n_negative=10):
-        self.user_item_matrix = dok_matrix(user_item_matrix)
-        self.user_item_pairs = numpy.asarray(self.user_item_matrix.nonzero()).T
-        self.batch_size = batch_size
-        self.n_negative = n_negative
-
-    @property
-    def sample(self):
-        while True:
-            numpy.random.shuffle(self.user_item_pairs)
-            for i in range(int(len(self.user_item_pairs) / self.batch_size)):
-                user_positive_items_pairs = self.user_item_pairs[i * self.batch_size: (i + 1) * self.batch_size, :]
-
-                negative_samples = numpy.random.randint(0,
-                                                        self.user_item_matrix.shape[1],
-                                                        size=(self.batch_size, self.n_negative))
-
-                yield user_positive_items_pairs, negative_samples
-
-    def next_batch(self):
-        return self.sample.__next__()
-
-
 class CML(object):
     def __init__(self,
                  n_users,
@@ -129,13 +63,15 @@ class CML(object):
                  hidden_layer_dim=128,
                  dropout_rate=0.2,
                  feature_l2_reg=0.1,
-                 feature_projection_scaling_factor=0.5
+                 feature_projection_scaling_factor=0.5,
+                 use_rank_weight=True,
+                 use_cov_loss=True,
+                 cov_loss_weight=0.1
                  ):
         """
 
         :param n_users: number of users i.e. |U|
         :param n_items: number of items i.e. |V|
-        :param
         :param embed_dim: embedding size i.e. K (default 20)
         :param features: (optional) the feature vectors of items, shape: (|V|, N_Features).
                Set it to None will disable feature loss(default: None)
@@ -147,6 +83,8 @@ class CML(object):
         :param feature_l2_reg: feature loss weight
         :param feature_projection_scaling_factor: scale the feature projection before compute l2 loss. Ideally,
                the scaled feature projection should be mostly within the clip_norm
+        :param use_rank_weight: whether to use rank weight
+        :param use_cov_loss: use covariance loss to discourage redundancy in the user/item embedding
         """
 
         self.n_users = n_users
@@ -169,6 +107,11 @@ class CML(object):
         self.user_positive_items_pairs = tf.placeholder(tf.int32, [None, 2])
         self.negative_samples = tf.placeholder(tf.int32, [None, None])
         self.score_user_ids = tf.placeholder(tf.int32, [None])
+
+        self.use_rank_weight = use_rank_weight
+        self.use_cov_loss = use_cov_loss
+        self.cov_loss_weight = cov_loss_weight
+
         self.user_embeddings
         self.item_embeddings
         self.embedding_loss
@@ -216,17 +159,26 @@ class CML(object):
         """
         :return: the l2 loss of the distance between items' their embedding and their feature projection
         """
+        loss = tf.constant(0, dtype=tf.float32)
         if self.feature_projection is not None:
-
             # the distance between feature projection and the item's actual location in the embedding
             feature_distance = tf.reduce_mean(tf.squared_difference(
                 self.item_embeddings,
                 self.feature_projection), 1)
 
             # apply regularization weight
-            return tf.reduce_sum(feature_distance, name="feature_loss") * self.feature_l2_reg
-        else:
-            return tf.constant(0, dtype=tf.float32)
+            loss += tf.reduce_sum(feature_distance, name="feature_loss") * self.feature_l2_reg
+
+        return loss
+    @define_scope
+    def covariance_loss(self):
+
+        X = tf.concat((self.item_embeddings, self.user_embeddings), 0)
+        n_rows = tf.cast(tf.shape(X)[0], tf.float32)
+        X = X - (tf.reduce_mean(X, axis=0))
+        cov = tf.matmul(X, X, transpose_a=True) / n_rows
+
+        return tf.reduce_sum(tf.matrix_set_diag(cov, tf.zeros(self.embed_dim, tf.float32))) * self.cov_loss_weight
 
     @define_scope
     def embedding_loss(self):
@@ -247,17 +199,14 @@ class CML(object):
         pos_items = tf.nn.embedding_lookup(self.item_embeddings, self.user_positive_items_pairs[:, 1],
                                            name="pos_items")
         # positive item to user distance (N)
-        pos_distances = tf.reduce_mean(tf.squared_difference(users, pos_items), 1, name="pos_distances")
+        pos_distances = tf.reduce_sum(tf.squared_difference(users, pos_items), 1, name="pos_distances")
 
         # negative item embedding (N, K, W)
         neg_items = tf.transpose(tf.nn.embedding_lookup(self.item_embeddings, self.negative_samples),
                                  (0, 2, 1), name="neg_items")
         # distance to negative items (N x W)
-        distance_to_neg_items = tf.reduce_mean(tf.squared_difference(tf.expand_dims(users, -1), neg_items), 1,
-                                               name="distance_to_neg_items")
-
-        # number of impostors for each user-positive-item pair
-        impostors = (tf.expand_dims(pos_distances, -1) - distance_to_neg_items + self.margin) > 0
+        distance_to_neg_items = tf.reduce_sum(tf.squared_difference(tf.expand_dims(users, -1), neg_items), 1,
+                                              name="distance_to_neg_items")
 
         # best negative item (among W negative samples) their distance to the user embedding (N)
         closest_negative_distances = tf.reduce_min(distance_to_neg_items, 1, name="closest_negative_distances")
@@ -265,10 +214,17 @@ class CML(object):
         # compute hinge loss (N)
         loss_per_pair = tf.maximum(pos_distances - closest_negative_distances + self.margin, 0,
                                    name="pair_loss")
-        weighted_loss_per_pair = loss_per_pair
+
+        if self.use_rank_weight:
+            # indicator matrix for impostors (N x W)
+            impostors = (tf.expand_dims(pos_distances, -1) - distance_to_neg_items + self.margin) > 0
+            # approximate the rank of positive item by (number of impostor / W per user-positive pair)
+            weight = tf.reduce_mean(tf.cast(impostors, dtype=tf.float32), 1, name="rank_weight")
+            # apply rank weight
+            loss_per_pair *= weight
 
         # the embedding loss
-        loss = tf.reduce_sum(weighted_loss_per_pair, name="loss")
+        loss = tf.reduce_sum(loss_per_pair, name="loss")
 
         return loss
 
@@ -277,7 +233,10 @@ class CML(object):
         """
         :return: the total loss = embedding loss + feature loss
         """
-        return self.embedding_loss + self.feature_loss
+        loss = self.embedding_loss + self.feature_loss
+        if self.use_cov_loss:
+            loss += self.covariance_loss
+        return loss
 
     @define_scope
     def clip_by_norm_op(self):
@@ -332,19 +291,17 @@ def optimize(model, sampler, train, valid):
         sess.run(tf.assign(model.item_embeddings, model.feature_projection))
     while True:
         # create evaluator on validation set
-        validation_recall = RecallEvaluator(train, valid)
+        validation_recall = RecallEvaluator(model, train, valid)
         # compute recall on validate set
         valid_recalls = []
         # sample some users to calculate recall validation
-        valid_users = list(set(valid.nonzero()[0]))[:300]
-        for user_chunk in toolz.partition_all(300, valid_users):
-            scores = sess.run(model.item_scores, {model.score_user_ids: user_chunk})
-            valid_recalls.extend([validation_recall.eval(user, user_scores)
-                                  for user, user_scores in zip(user_chunk, scores)]
-                                 )
+        valid_users = list(set(valid.nonzero()[0]))[:1000]
+
+        # compute recall in chunks to utilize speedup provided by Tensorflow
+        for user_chunk in toolz.partition_all(100, valid_users):
+            valid_recalls.extend([validation_recall.eval(sess, user_chunk)])
         print("\nRecall on (sampled) validation set: {}".format(numpy.mean(valid_recalls)))
         # TODO: early stopping based on validation recall
-
 
         # train model
         losses = []
@@ -384,6 +341,10 @@ if __name__ == '__main__':
                 clip_norm=1.1,
                 # learning rate for AdaGrad
                 master_learning_rate=0.5,
+
+                use_rank_weight=False,
+                use_cov_loss=True,
+                cov_loss_weight=0.1
                 )
 
     optimize(model, sampler, train, valid)
