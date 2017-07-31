@@ -20,6 +20,7 @@ A Tensorflow implementation of Collaborative Metric Learning (CML):
  * tensorflow
  * scipy
  * scikit-learn
+
 # Usage
 ```bash
 # install requirements
@@ -30,7 +31,7 @@ python3 CML.py
 
 # Known Issue
 * AdaGrad does not seem to work on GPU. Try using AdamOptimizer instead
-* the WithFeature version does not seems to perform as well as the Theano version.
+* the WithFeature version does not seems to perform as well as the Theano version. It is being investigated.
 
 # Visuals
 ### An illustration of embbeding learning procedue of CML
