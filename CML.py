@@ -162,7 +162,7 @@ class CML(object):
         loss = tf.constant(0, dtype=tf.float32)
         if self.feature_projection is not None:
             # the distance between feature projection and the item's actual location in the embedding
-            feature_distance = tf.reduce_mean(tf.squared_difference(
+            feature_distance = tf.reduce_sum(tf.squared_difference(
                 self.item_embeddings,
                 self.feature_projection), 1)
 
