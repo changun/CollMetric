@@ -31,7 +31,7 @@ python3 CML.py
 
 # Known Issue
 * AdaGrad does not seem to work on GPU. Try using AdamOptimizer instead
-* the WithFeature version does not seems to perform as well as the Theano version. It is being investigated.
+* ~~the WithFeature version does not seems to perform as well as the Theano version. It is being investigated.~~ (The performance is actually slightly better (with AdamOptimizer) than the number reported in the paper now!)
 
 # Visuals
 ### An illustration of embbeding learning procedue of CML
