@@ -10,6 +10,11 @@ A Tensorflow implementation of Collaborative Metric Learning (CML):
 * Allows the exploitation of item features (e.g. tags, text, image features).
 * Outperforms state-of-the-art recommendation algorithms on a wide range of tasks
 * Enjoys an extremely efficient Top-K search using Fast KNN algorithms.
+
+# Utility Features
+* Parallel negative sampler that can sample the user-item pairs when the model is being trained on GPU
+* Fast recall evaluation based on Tensorflow
+
 # Requirements
  * python3
  * tensorflow
@@ -22,6 +27,11 @@ pip3 install -r requirements.txt
 # run demo tensorflow model
 python3 CML.py
 ```
+
+# Known Issue
+* AdaGrad does not seem to work on GPU. Try using AdamOptimizer instead
+* the WithFeature version does not seems to perform as well as the Theano version.
+
 # Visuals
 ### An illustration of embbeding learning procedue of CML
 ![CML](http://portalparts.acm.org/3060000/3052639/core/fp0554.jpg)
