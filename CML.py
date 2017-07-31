@@ -1,11 +1,8 @@
 import functools
-
 import numpy
-import pandas
 import tensorflow as tf
 import toolz
 from tqdm import tqdm
-
 from evaluator import RecallEvaluator
 from sampler import WarpSampler
 from utils import citeulike, split_data
@@ -366,7 +363,7 @@ if __name__ == '__main__':
                 cov_loss_weight=1
                 )
 
-    optimize(model, sampler, train, valid)
+    #optimize(model, sampler, train, valid)
 
     # WITH features
     # In this case, we additionally train a feature projector to project raw item features into the
@@ -378,7 +375,7 @@ if __name__ == '__main__':
                 # enable feature projection
                 features=dense_features,
                 embed_dim=EMBED_DIM,
-                margin=1.0,
+                margin=2.0,
                 clip_norm=1.1,
                 master_learning_rate=0.1,
                 # the size of the hidden layer in the feature projector NN
@@ -402,7 +399,7 @@ if __name__ == '__main__':
 
                 # whether to enable covariance regularization to encourage efficient use of the vector space.
                 # More useful when the size of embedding is smaller (e.g. < 20 ).
-                use_cov_loss=True,
+                use_cov_loss=False,
 
                 # weight of the cov_loss
                 cov_loss_weight=1
