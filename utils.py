@@ -9,6 +9,7 @@ def citeulike(tag_occurence_thres=10):
     user_dict = defaultdict(set)
     for u, item_list in enumerate(open("citeulike-t/users.dat").readlines()):
         items = item_list.strip().split(" ")
+        # ignore the first element in each line, which is the number of items the user liked. 
         for item in items[1:]:
             user_dict[u].add(int(item))
 
@@ -18,6 +19,7 @@ def citeulike(tag_occurence_thres=10):
     user_item_matrix = dok_matrix((n_users, n_items), dtype=np.int32)
     for u, item_list in enumerate(open("citeulike-t/users.dat").readlines()):
         items = item_list.strip().split(" ")
+        # ignore the first element in each line, which is the number of items the user liked. 
         for item in items[1:]:
             user_item_matrix[u, int(item)] = 1
 
